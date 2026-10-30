@@ -13,10 +13,10 @@ android {
     compileSdk 34
 
     defaultConfig {
-        applicationId "app.floatphone.shell"
+        applicationId "app.floatphone.momo"
         minSdk 26
         targetSdk 34
-        versionCode 32
+        versionCode 1
         versionName "1.0.33"
         buildConfigField "String", "SITE_URL", "\"${siteUrl}\""
     }

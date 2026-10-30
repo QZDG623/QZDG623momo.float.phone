@@ -1,16 +1,18 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { ChatSession, ChatMessage, loadChatMessages, pushChatMessage, getLatestCharacterStateValues, resolveChatCharacterAvatar, resolveChatUserAvatar } from "@/lib/chat-storage";
+import { ChatSession, ChatMessage, loadChatMessages, pushChatMessage, updateChatMessage, getLatestCharacterStateValues, resolveChatUserAvatar } from "@/lib/chat-storage";
 import { getStatusRegionConfig, isCustomStatusRegionActive } from "@/lib/chat-status-region";
 import { generateGroupChatCompletion } from "@/lib/group-chat-engine";
 import { parseAIResponse } from "@/lib/rich-message-parser";
 import { resolveUserIdentity } from "@/lib/settings-storage";
 import { cancelFollowUp } from "@/lib/follow-up-service";
+import { persistCallAudio } from "@/lib/call-audio-storage";
+import { suspendBailoutsForCall } from "@/lib/push-bailout-client";
 import { createSTTSession, type STTSession } from "@/lib/stt-service";
 import { resolveVoiceConfig, synthesizeSpeech, playAudioBlob, playAudioBlobViaMediaElement, setCallAudioSessionActive } from "@/lib/tts-service";
 import { isCallRecordingSupported, resolveCloudSttConfig } from "@/lib/stt-cloud";
-import { useHoldToTalk } from "./use-hold-to-talk";
+import { useContinuousVoice } from "./use-continuous-voice";
 import { suspendKeepAliveForCall, resumeKeepAliveAfterCall } from "@/lib/use-weixin-bridge";
 import { BilingualTextBlock } from "./message-bubble";
 import { splitBilingualText } from "@/lib/bilingual-text";
@@ -20,6 +22,12 @@ import { isAndroidBrowser, isIOSDevice } from "./voice-input-platform";
 import { CallVolumeControl } from "./call-volume-control";
 import { startIncomingCallVibration } from "@/lib/call-vibration";
 import { useCallScreenSounds } from "@/lib/chat-sound";
+import { CallMiniWindow } from "./call-mini-window";
+import { useShellCallOverlay } from "./use-shell-call-overlay";
+import { CallAutoChatControl } from "./call-auto-chat-control";
+import { useCallAutoChat } from "./use-call-auto-chat";
+import { useCallReplyQueue } from "./use-call-reply-queue";
+import { stopShellCallOverlay } from "@/lib/shell-call-overlay";
 
 // ── Types ───────────────────────────────────────────
 
@@ -53,13 +61,19 @@ type GroupCallScreenProps = {
     onEnd: () => void;
     initiator?: "user" | "character";
     initiatorName?: string; // 发起通话的角色名（initiator="character" 时使用）
+    /** 通话是否处于缩小的悬浮窗状态：通话继续（识别/播放/计时不停），界面缩为小窗 */
+    minimized?: boolean;
+    /** 点击左上角返回键：请求缩小为悬浮窗（通话继续，不挂断） */
+    onMinimize?: () => void;
+    /** 点击悬浮窗：请求恢复为全屏通话界面 */
+    onRestore?: () => void;
 };
 
 // ── Component ───────────────────────────────────────
 
-export function GroupCallScreen({ type, session, characters, onEnd, initiator = "user", initiatorName }: GroupCallScreenProps) {
+export function GroupCallScreen({ type, session, characters, onEnd, initiator = "user", initiatorName, minimized = false, onMinimize, onRestore }: GroupCallScreenProps) {
     // 同 voice-call-screen：iOS 保留 Web Speech 免提 + Web Audio 播放；
-    // 其余设备改按住说话 + 云端转写，播放走媒体元素。没配识别时回落旧行为。
+    // 其余设备改免提连续监听 + 云端转写，播放走媒体元素。没配识别时回落旧行为。
     const iosDeviceRef = useRef(isIOSDevice());
     const iosDevice = iosDeviceRef.current;
     const holdToTalkRef = useRef(
@@ -87,6 +101,11 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
     const callStartRef = useRef<number>(0);
     const stateRef = useRef<string>("CONNECTING");
     const interimTextRef = useRef<string>("");
+    // 时长的 ref 快照：同步给原生浮窗时读，避免把每秒变化的 callDuration 塞进 effect 依赖
+    const callDurationRef = useRef(0);
+    // 自动搭话的通知口：runConversationTurn 定义在 useCallAutoChat 之前，
+    // 用 ref 转发避开循环依赖
+    const autoChatNotifyRef = useRef<{ userSpoke: () => void; assistantSpoke: (produced: boolean) => void } | null>(null);
     const subtitleScrollRef = useRef<HTMLDivElement>(null);
     const messagesRef = useRef<ChatMessage[]>([]);
     const userNameRef = useRef<string>("你");
@@ -135,6 +154,7 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
 
     // Keep refs in sync
     useEffect(() => { stateRef.current = callState; }, [callState]);
+    useEffect(() => { callDurationRef.current = callDuration; }, [callDuration]);
 
     // 来电等待接听：循环振动（开关在聊天主页，iOS 网页不支持自动无效果）
     // + 来电/致电铃声与挂断音（角色专属提示音优先，其余在"全局聊天信息 → 提示音"）
@@ -166,6 +186,8 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
     // ── Init ─────────────────────────────────────────
     useEffect(() => {
         cancelFollowUp(session.id);
+        // 通话期间不打扰：撤掉已挂在服务端的离线预约（详见 voice-call-screen）
+        void suspendBailoutsForCall(session.id);
         const ui = resolveUserIdentity(undefined, "group_chat");
         userNameRef.current = ui?.name || "你";
         userAvatarRef.current = resolveChatUserAvatar(session, ui?.avatarUrl) || null;
@@ -209,9 +231,9 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
     const stateLabel = (): string => {
         switch (callState) {
             case "CONNECTING": return initiator === "character" ? "来电..." : "正在呼叫...";
-            case "IDLE": return isMuted && !holdToTalk ? "已静音" : (holdToTalk && inputMode === "voice" ? "按住麦克风说话" : "通话中");
-            case "USER_SPEAKING": return holdToTalk ? "松开发送" : "正在聆听...";
-            case "PROCESSING": return holdToTalk && holdInput.recState === "transcribing" ? "识别中..." : "对方正在思考...";
+            case "IDLE": return isMuted ? "已静音" : "通话中";
+            case "USER_SPEAKING": return "正在聆听...";
+            case "PROCESSING": return continuousVoice.state === "transcribing" ? "识别中..." : "对方正在思考...";
             case "AI_SPEAKING": return "对方正在说话...";
             case "ENDED": return "通话已结束";
         }
@@ -220,10 +242,16 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
     // ── Conversation turn ────────────────────────────
     const runConversationTurn = useCallback(async (userText?: string) => {
         if (userText) {
+            // 用户开口：自动搭话重新计数（上限按「你开口后」重新算）
+            autoChatNotifyRef.current?.userSpoke();
             const userMsg = pushChatMessage({
                 sessionId: session.id, role: "user", content: userText,
+                // 标记来源为通话：折叠只收这类消息
+                origin: "call",
             });
             messagesRef.current = [...messagesRef.current, userMsg];
+            // 通知聊天室刷新（通话屏在聊天室之外，不广播就要等挂断才同步）
+            window.dispatchEvent(new CustomEvent("chat-messages-updated", { detail: { sessionId: session.id } }));
             setSubtitles(prev => [...prev, { id: userMsg.id, role: "user", text: userText }]);
         }
 
@@ -253,6 +281,8 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
                 const aiMsg = pushChatMessage({
                     sessionId: session.id, role: "assistant",
                     content: displayText,
+                    // 标记来源为通话：折叠只收这类消息
+                    origin: "call",
                     statusPanel: statusPanel || undefined,
                     // 自定义状态栏渲染戳：不盖的话 custom 模式下 [状态栏] 原文按 markdown 渲染
                     statusRegionMode: statusPanel && isCustomStatusRegionActive(getStatusRegionConfig(session.id, false))
@@ -265,6 +295,7 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
                     senderName: r.characterName,
                 });
                 messagesRef.current = [...messagesRef.current, aiMsg];
+                window.dispatchEvent(new CustomEvent("chat-messages-updated", { detail: { sessionId: session.id } }));
 
                 setSubtitles(prev => [...prev, {
                     id: aiMsg.id, role: "assistant",
@@ -282,6 +313,19 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
                         const audioBlob = await synthesizeSpeech(speechText, voiceConfig);
                         if (stateRef.current === "ENDED") return;
                         if (audioBlob) {
+                            // 落库留档：音频进媒体库，引用写进这条消息，供「通话统计」复听原音。
+                            // 群通话每个角色各自合成（音色也可能不同），所以逐条挂、不合并。
+                            void persistCallAudio(audioBlob, {
+                                sessionId: session.id,
+                                characterId: r.characterId,
+                            }).then(ref => {
+                                if (!ref) return;
+                                const target = loadChatMessages(session.id).find(item => item.id === aiMsg.id);
+                                if (!target) return;
+                                updateChatMessage(aiMsg.id, {
+                                    mediaData: { ...(target.mediaData || {}), callAudioRef: ref },
+                                });
+                            });
                             const { promise, abort } = playCallAudio(audioBlob);
                             audioAbortRef.current = abort;
                             await promise;
@@ -294,7 +338,11 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
                 setSpeakingCharId(null);
             }
 
-            if (stateRef.current !== "ENDED") setCallState("IDLE");
+            if (stateRef.current !== "ENDED") {
+                // 说完一轮：安排下一次自动搭话
+                autoChatNotifyRef.current?.assistantSpoke(true);
+                setCallState("IDLE");
+            }
         } catch (error: any) {
             console.error("[GroupCall] Error:", error);
             if (stateRef.current !== "ENDED") {
@@ -302,6 +350,7 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
                     id: `err-${Date.now()}`, role: "assistant",
                     text: `⚠️ ${error?.message || "发送失败"}`,
                 }]);
+                autoChatNotifyRef.current?.assistantSpoke(false);
                 setCallState("IDLE");
             }
         }
@@ -309,7 +358,7 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
 
     // ── Auto-listen ──────────────────────────────────
     const startListening = useCallback(() => {
-        if (holdToTalk) return; // 按住说话模式不用 Web Speech 自动监听
+        if (holdToTalk) return; // 免提连续监听模式不用 Web Speech 自动监听
         if (androidTextInputOnly) {
             setInputMode("text");
             return;
@@ -356,7 +405,7 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
     }, [androidTextInputOnly, holdToTalk, runConversationTurn, characters]);
 
     useEffect(() => {
-        if (holdToTalk) return; // 按住说话模式无自动监听
+        if (holdToTalk) return; // 免提连续监听模式有自己的启停 effect
         if (inputMode === "text" && sttRef.current) {
             sttRef.current.abort();
             sttRef.current = null;
@@ -371,37 +420,11 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
         if (isMuted && sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
     }, [androidTextInputOnly, holdToTalk, callState, isMuted, inputMode, startListening]);
 
-    const handleInputModeToggle = useCallback(() => {
-        if (androidTextInputOnly) {
-            if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
-            setInterimText("");
-            if (stateRef.current === "USER_SPEAKING") setCallState("IDLE");
-            setInputMode("text");
-            return;
-        }
-        if (inputMode === "voice") {
-            if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
-            setInterimText("");
-            if (stateRef.current === "USER_SPEAKING") setCallState("IDLE");
-            setInputMode("text");
-        } else {
-            setInputMode("voice");
-        }
-    }, [androidTextInputOnly, inputMode]);
-
-    const handleTextSubmit = useCallback(() => {
-        const text = typedText.trim();
-        if (!text || callState !== "IDLE") return;
-        if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
-        setTypedText("");
-        runConversationTurn(text);
-    }, [typedText, callState, runConversationTurn]);
-
-    // 按住说话（非 iOS）：按下录音，松开转写后走对话轮。群聊无单角色绑定，
+    // 免提连续监听（非 iOS）：进了语音模式就一直听，开口自动录、停顿自动切段、
+    // 每段转写后直接发出去，用户不用按任何按钮，像真·电话一样。群聊无单角色绑定，
     // 识别配置取第一个可用的 OpenAI 兼容语音配置。
-    const holdInput = useHoldToTalk({
-        canStart: () => stateRef.current === "IDLE",
-        onRecordingStart: () => {
+    const continuousVoice = useContinuousVoice({
+        onSpeechStart: () => {
             setInterimText("");
             if (stateRef.current === "IDLE") setCallState("USER_SPEAKING");
         },
@@ -417,10 +440,65 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
         },
     });
 
+    // 连续监听的启停：语音模式 + IDLE/USER_SPEAKING + 未静音 → 启动；
+    // 其余（文字模式 / PROCESSING / AI_SPEAKING / 静音 / 结束）→ 停止。
+    // PROCESSING 与 AI_SPEAKING 期间必须停，否则会把角色 TTS 的声音录进去。
+    useEffect(() => {
+        if (!holdToTalk) return;
+        if (callState === "CONNECTING" || callState === "ENDED") {
+            continuousVoice.stop();
+            return;
+        }
+        if (inputMode !== "voice") {
+            continuousVoice.stop();
+            return;
+        }
+        if (callState === "IDLE" || callState === "USER_SPEAKING") {
+            continuousVoice.setMuted(isMuted);
+            continuousVoice.start();
+        } else {
+            // AI 思考/说话期间只静音，不释放麦克风：每轮 stop 再 start 会让安卓上
+            // 旧的音频设备来不及释放，紧接着的申请就报 NotReadableError，
+            // 表现就是「系统权限开着却打不开麦克风」。
+            continuousVoice.setMuted(true);
+        }
+    }, [holdToTalk, callState, inputMode, isMuted, continuousVoice.start, continuousVoice.stop, continuousVoice.setMuted]);
+
+    const handleInputModeToggle = useCallback(() => {
+        if (androidTextInputOnly) {
+            if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
+            continuousVoice.stop();
+            setInterimText("");
+            if (stateRef.current === "USER_SPEAKING") setCallState("IDLE");
+            setInputMode("text");
+            return;
+        }
+        if (inputMode === "voice") {
+            if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
+            continuousVoice.stop();
+            setInterimText("");
+            if (stateRef.current === "USER_SPEAKING") setCallState("IDLE");
+            setInputMode("text");
+        } else {
+            setInputMode("voice");
+        }
+    }, [androidTextInputOnly, inputMode, continuousVoice.stop]);
+
+    const handleTextSubmit = useCallback(() => {
+        const text = typedText.trim();
+        if (!text || callState !== "IDLE") return;
+        if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
+        setTypedText("");
+        runConversationTurn(text);
+    }, [typedText, callState, runConversationTurn]);
+
     // ── Hangup ──────────────────────────────────────
     const handleHangup = useCallback(() => {
+        // 挂断时收掉安卓壳的原生浮窗
+        stopShellCallOverlay();
         setCallState("ENDED");
         if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
+        continuousVoice.stop();
         if (audioAbortRef.current) { audioAbortRef.current(); audioAbortRef.current = null; }
         if (window.speechSynthesis) window.speechSynthesis.cancel();
 
@@ -432,6 +510,36 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
         setTimeout(() => onEnd(), 1500);
     }, [session.id, callDuration, onEnd, callTypeLabel]);
 
+    // 待发送队列：角色说话/思考时发来的消息先排队，空闲后自动补发，
+    // 不再像从前那样忙就直接丢掉（浮窗回复条尤其容易空发）。
+    const replyQueue = useCallReplyQueue({
+        callState,
+        callStateRef: stateRef,
+        runTurn: (text) => { void runConversationTurn(text); },
+        active: callState !== "CONNECTING" && callState !== "ENDED",
+    });
+
+    // 自动搭话：没人出声时让群里随机某位主动找话说（与语音/视频通话同一套配置）。
+    // 放在 runConversationTurn / handleHangup 之后，避免 const 的暂时性死区。
+    const autoChat = useCallAutoChat({
+        active: callState !== "CONNECTING" && callState !== "ENDED",
+        callStateRef: stateRef,
+        runTurn: () => { void runConversationTurn(); },
+        beforeTrigger: () => {
+            // 触发前先停掉在听的识别，免得把角色自己的声音录进去
+            if (sttRef.current) {
+                sttRef.current.abort();
+                sttRef.current = null;
+            }
+            continuousVoice.stop();
+            setInterimText("");
+        },
+    });
+    autoChatNotifyRef.current = {
+        userSpoke: autoChat.notifyUserSpoke,
+        assistantSpoke: autoChat.notifyAssistantSpoke,
+    };
+
     // 通话音频会话 + 卸载兜底：不经挂断键退出时释放识别与在途播放，
     // 防止识别自动重启循环在后台无限自我重启、麦克风永不归还（详见 voice-call-screen）。
     useEffect(() => {
@@ -439,10 +547,33 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
         return () => {
             stateRef.current = "ENDED";
             if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
+            continuousVoice.stop();
             if (audioAbortRef.current) { audioAbortRef.current(); audioAbortRef.current = null; }
             setCallAudioSessionActive(false);
         };
     }, []);
+
+    // 安卓壳原生浮窗：切到别的 App 时挂一个能浮在上层的小窗。
+    // 三个通话屏共用同一个 hook；放在 handleHangup 之后，避免 const 的暂时性死区。
+    useShellCallOverlay({
+        active: callState !== "ENDED" && callState !== "CONNECTING",
+        label: `群${callTypeLabel} (${characters.length + 1}人)`,
+        name: `群${callTypeLabel}`,
+        avatar: voiceBgResolved || resolvedBgs[characters[0]?.id || ""] || characters[0]?.avatar || null,
+        getDuration: () => callDurationRef.current,
+        // 浮窗里发来的消息一律进队列：忙时排队、空闲时自动补发，不再静默丢弃
+        onReply: (text) => { replyQueue.submit(text); },
+        onHangup: () => handleHangup(),
+        onRestore,
+        onTick: (seconds) => {
+            // 只前进、不后退：避免时长来回跳、挂断写进记录的时长跟着乱
+            if (seconds > callDurationRef.current) {
+                callStartRef.current = Date.now() - seconds * 1000;
+                callDurationRef.current = seconds;
+                setCallDuration(seconds);
+            }
+        },
+    });
 
     // ── Control buttons (shared between voice and video) ──
     const renderTextInputPanel = (floating = false) => {
@@ -481,60 +612,6 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
 
     const renderControls = () => {
         if (callState !== "ENDED" && callState !== "CONNECTING") {
-            if (holdToTalk) {
-                return (
-                    <>
-                        {/* 输入方式切换（按住说话模式不需要持续开麦，静音位改放 Aa 切换） */}
-                        <button
-                            onClick={handleInputModeToggle}
-                            className={`ui-call-btn ${isVideo ? "ui-call-btn-sm" : ""} ui-call-btn-muted`}
-                            aria-label={inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
-                        >
-                            {inputMode === "voice" ? (
-                                <span className="ui-call-input-text-icon">Aa</span>
-                            ) : (
-                                <svg width={isVideo ? 22 : 24} height={isVideo ? 22 : 24} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                                    <line x1="12" y1="19" x2="12" y2="22" />
-                                </svg>
-                            )}
-                        </button>
-
-                        {/* 按住说话主按钮（文字模式下点按切回语音） */}
-                        <button
-                            className={`ui-call-mic ${isVideo ? "" : "ui-call-mic-lg"}`}
-                            style={{ touchAction: "none" }}
-                            data-state={
-                                inputMode === "text" ? "text"
-                                    : holdInput.recState === "recording" ? "speaking"
-                                    : callState === "IDLE" ? "idle"
-                                    : "busy"
-                            }
-                            aria-label={inputMode === "text" ? "切换到语音输入" : "按住说话"}
-                            title={inputMode === "text" ? "切换到语音输入" : "按住说话"}
-                            {...(inputMode === "voice" ? holdInput.pressHandlers : { onClick: handleInputModeToggle })}
-                        >
-                            {inputMode === "text" ? (
-                                <span className="ui-call-input-text-icon">Aa</span>
-                            ) : (
-                                <svg width={isVideo ? 28 : 32} height={isVideo ? 28 : 32} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                                    <line x1="12" y1="19" x2="12" y2="22" />
-                                </svg>
-                            )}
-                        </button>
-
-                        <button onClick={handleHangup} className={`ui-call-btn ${isVideo ? "ui-call-btn-sm" : ""} ui-call-btn-danger`} aria-label="挂断">
-                            <svg width={isVideo ? 22 : 24} height={isVideo ? 22 : 24} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91" />
-                                <line x1="23" y1="1" x2="1" y2="23" />
-                            </svg>
-                        </button>
-                    </>
-                );
-            }
             if (androidTextInputOnly) {
                 return (
                     <button onClick={handleHangup} className={`ui-call-btn ${isVideo ? "ui-call-btn-sm" : ""} ui-call-btn-danger`} aria-label="挂断">
@@ -549,7 +626,11 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
             return (
                 <>
                     <button
-                        onClick={() => setIsMuted(!isMuted)}
+                        onClick={() => {
+                            const next = !isMuted;
+                            setIsMuted(next);
+                            if (holdToTalk) continuousVoice.setMuted(next);
+                        }}
                         className={`ui-call-btn ${isVideo ? "ui-call-btn-sm" : ""} ui-call-btn-muted`}
                         {...(isMuted ? { "data-checked": "" } : {})}
                     >
@@ -578,8 +659,8 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
                                 : callState === "IDLE" ? (isMuted ? "idle-muted" : "idle")
                                 : "busy"
                         }
-                        aria-label={androidTextInputOnly ? "文字输入" : inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
-                        title={androidTextInputOnly ? "安卓浏览器使用文字输入" : inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
+                        aria-label={inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
+                        title={inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
                     >
                         {inputMode === "text" ? (
                             <span className="ui-call-input-text-icon">Aa</span>
@@ -649,6 +730,24 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
         return <div className="ts-14 opacity-70">通话已结束</div>;
     };
 
+    // ── MINIMIZED (悬浮窗) ──────────────────────────
+    // 与单聊一致：缩成小窗后通话继续，点一下回全屏。群聊没有单一角色，
+    // 背景优先用会话背景，其次取首位成员头像。
+    if (minimized) {
+        return (
+            <CallMiniWindow
+                imageUrl={voiceBgResolved || resolvedBgs[characters[0]?.id || ""] || characters[0]?.avatar || null}
+                title={`群${callTypeLabel}`}
+                meta={[`${characters.length + 1}人`, formatTime(callDuration)]}
+                ariaLabel={`返回群${callTypeLabel}`}
+                onRestore={onRestore}
+                // 长按小窗就地回复，不必先跳回通话界面
+                onReply={(text) => replyQueue.submit(text) !== "rejected"}
+                pendingCount={replyQueue.pending}
+            />
+        );
+    }
+
     // ── VIDEO MODE RENDER ───────────────────────────
     if (isVideo) {
         // Grid: participants + self-cam — auto layout to fit screen
@@ -659,6 +758,36 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
         return (
             <div className="gcall-video-root voicecall-controls call-keyboard-shift" style={keyboardOffsetStyle}>
                 <CallVolumeControl />
+                {/* 待发送提示：群里说完这轮就会自动发出去，避免以为消息丢了 */}
+                {replyQueue.pending > 0 && (
+                    <div
+                        style={{
+                            position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)",
+                            zIndex: 45, padding: "4px 12px", borderRadius: 999,
+                            background: "rgba(20,20,26,0.8)", backdropFilter: "blur(8px)",
+                            fontSize: 11.5, color: "#fff", whiteSpace: "nowrap",
+                        }}
+                    >
+                        对方说完就发 · 还有 {replyQueue.pending} 条
+                    </div>
+                )}
+                {/* 自动搭话：没人出声时让群里随机某位主动找话说 */}
+                {callState !== "CONNECTING" && callState !== "ENDED" && (
+                    <CallAutoChatControl config={autoChat.config} onUpdate={autoChat.update} />
+                )}
+                {onMinimize && callState !== "ENDED" && callState !== "CONNECTING" && (
+                    <button
+                        type="button"
+                        className="call-back-btn"
+                        onClick={onMinimize}
+                        aria-label="缩小通话"
+                        title="缩小通话"
+                    >
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M15 18l-6-6 6-6" />
+                        </svg>
+                    </button>
+                )}
                 {/* Video grid */}
                 <div
                     className="flex-1 min-h-0 grid gap-[2px] overflow-hidden"
@@ -759,6 +888,39 @@ export function GroupCallScreen({ type, session, characters, onEnd, initiator = 
             <div className="call-overlay" {...(voiceBgResolved ? { "data-has-image": "" } : {})} />
 
             <CallVolumeControl />
+
+            {/* 待发送提示：群里说完这轮就会自动发出去，避免以为消息丢了 */}
+            {replyQueue.pending > 0 && (
+                <div
+                    style={{
+                        position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)",
+                        zIndex: 45, padding: "4px 12px", borderRadius: 999,
+                        background: "rgba(20,20,26,0.8)", backdropFilter: "blur(8px)",
+                        fontSize: 11.5, color: "#fff", whiteSpace: "nowrap",
+                    }}
+                >
+                    对方说完就发 · 还有 {replyQueue.pending} 条
+                </div>
+            )}
+
+            {/* 自动搭话：没人出声时让群里随机某位主动找话说 */}
+            {callState !== "CONNECTING" && callState !== "ENDED" && (
+                <CallAutoChatControl config={autoChat.config} onUpdate={autoChat.update} />
+            )}
+
+            {onMinimize && callState !== "ENDED" && callState !== "CONNECTING" && (
+                <button
+                    type="button"
+                    className="call-back-btn"
+                    onClick={onMinimize}
+                    aria-label="缩小通话"
+                    title="缩小通话"
+                >
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M15 18l-6-6 6-6" />
+                    </svg>
+                </button>
+            )}
 
             <div className="gcall-body voicecall-controls">
                 {/* Top bar */}

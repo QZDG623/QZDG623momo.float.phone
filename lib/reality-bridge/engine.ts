@@ -22,6 +22,7 @@ import { getWeekStartIso } from "../calendar-utils";
 import { sendBrowserNotification } from "../browser-notification";
 import { dispatchChatMessageNotice } from "../chat-notification-events";
 import { createShortcutCommand } from "../shortcut-command-client";
+import { runDeviceAction } from "../device-action";
 import {
   REALITY_BRIDGE_DATA_EVENT,
   type BridgeFeedEntry,
@@ -39,6 +40,11 @@ import {
   markBridgeRuleRun,
   mergeBridgeRuleRuns,
 } from "./storage";
+import {
+  enqueueDelayedTask,
+  loadDelayedTasks,
+  saveDelayedTasks,
+} from "./delayed-queue";
 
 const BRIDGE_SOURCE = { id: "reality_bridge", name: "现实桥" };
 
@@ -241,6 +247,37 @@ async function runActions(rule: BridgeRule, item: BridgeItem, text: string): Pro
       }
     }
   }
+  if (actions.deviceAction?.action) {
+    // 参数先展开 {payload}/{type}：这样能配出「收到『到家』→ 打开 {payload}」
+    const filledArgs: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(actions.deviceAction.args ?? {})) {
+      filledArgs[key] = typeof value === "string" ? fillTemplate(value, item) : value;
+    }
+    const outcome = runDeviceAction({ action: actions.deviceAction.action, ...filledArgs });
+    done.push(outcome.ok ? `操作设备·${outcome.message ?? "已执行"}` : `操作设备失败：${outcome.reason ?? "未知原因"}`);
+  }
+  if (actions.tool?.name) {
+    // 动态 import：tool-executor → perception → 本模块，静态引入会绕成循环依赖。
+    const toolArgs: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(actions.tool.args ?? {})) {
+      toolArgs[key] = typeof value === "string" ? fillTemplate(value, item) : value;
+    }
+    const toolName = actions.tool.name;
+    try {
+      const { executeToolCalls } = await import("../tool-executor");
+      const results = await executeToolCalls([{ name: toolName, args: toolArgs }], {
+        appId: "chat",
+        sourceEngine: "chat",
+        characterId: actions.tool.characterId || actions.chat?.characterId,
+      });
+      const first = results[0];
+      done.push(first?.success
+        ? `调用「${toolName}」${first.data ? `：${first.data.slice(0, 80)}` : "完成"}`
+        : `调用「${toolName}」失败：${(first?.error ?? "动作未找到").slice(0, 80)}`);
+    } catch (err) {
+      done.push(`调用「${toolName}」失败：${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`);
+    }
+  }
   if (actions.outbox?.type) {
     const { config, ready } = bridgeConnection();
     if (ready) {
@@ -360,10 +397,31 @@ export async function applyServerBridgeEntry(meta: {
   return { sessionId };
 }
 
+/**
+ * 规则的关键词过滤：空 = 不限；否则要求信号正文里出现其中之一。
+ *
+ * 大小写不敏感；分隔符接受 | , ，、 三种写法，用哪种用户顺眼就用哪种。
+ * 分隔后全是空串（用户只敲了几个逗号）时视为不限——否则规则会静默失效，
+ * 而用户看到的是「我明明填了过滤却一条都不触发」，极难排查。
+ */
+function matchesPayloadFilter(filter: string | undefined, payload: string): boolean {
+  const raw = (filter ?? "").trim();
+  if (!raw) return true;
+  const terms = raw.split(/[|,，、]/).map(term => term.trim()).filter(Boolean);
+  if (terms.length === 0) return true;
+  const haystack = String(payload ?? "").toLowerCase();
+  return terms.some(term => haystack.includes(term.toLowerCase()));
+}
+
 /** 处理一条收件箱数据：匹配规则 → 加工 → 执行动作 → 记录流水。 */
 export async function processBridgeItem(item: BridgeItem): Promise<BridgeFeedEntry> {
-  const rules = loadBridgeRules().filter(rule =>
-    rule.enabled && (rule.matchType === "*" || rule.matchType === item.type));
+  // 定时规则不参与信号匹配：它们由 runDueScheduledRules() 直接触发，
+  // 若混进来，任何一条信号都会把它们捎带着跑一遍。
+  const rules = loadBridgeRules().filter(rule => {
+    if (!rule.enabled || rule.schedule) return false;
+    if (rule.matchType !== "*" && rule.matchType !== item.type) return false;
+    return matchesPayloadFilter(rule.payloadFilter, item.payload);
+  });
   const entry: BridgeFeedEntry = {
     id: item.id,
     type: item.type,
@@ -383,6 +441,23 @@ export async function processBridgeItem(item: BridgeItem): Promise<BridgeFeedEnt
       markBridgeRuleRun(rule.id);
       const text = await processText(rule, item);
       if (text !== item.payload) entry.processed = text.slice(0, 2000);
+      const delay = Math.max(0, Number(rule.delayMinutes) || 0);
+      if (delay > 0) {
+        // 延迟执行：加工结果先存起来，到点直接用它，不再加工一次
+        // （否则「AI 先处理」会在延迟前后各跑一遍模型，结果还可能不一样）。
+        const task = enqueueDelayedTask({
+          ruleId: rule.id,
+          ruleName: rule.name,
+          item,
+          text,
+          delayMinutes: delay,
+        });
+        if (task) {
+          entry.actions.push(`${delay} 分钟后执行（已排队）`);
+          continue;
+        }
+        entry.actions.push("延迟排队失败，已改为立刻执行");
+      }
       entry.actions.push(...await runActions(rule, item, text));
     } catch (err) {
       entry.error = err instanceof Error ? err.message : String(err);
@@ -398,4 +473,257 @@ export async function processBridgeItem(item: BridgeItem): Promise<BridgeFeedEnt
   if (rules.length === 0 && entry.actions.length === 0) entry.actions.push("仅存档（无匹配规则）");
   appendBridgeFeed(entry);
   return entry;
+}
+
+/**
+ * 跑一遍到点的延迟任务。调度器每轮调用一次。
+ *
+ * 规则在排队后被删掉或停用时不再执行，但会记一条流水说明——
+ * 静默丢掉会让用户以为「延迟功能坏了」，说清原因他才好排查。
+ *
+ * @returns 本次真正执行的任务数
+ */
+export async function runDueDelayedTasks(): Promise<number> {
+  const tasks = loadDelayedTasks();
+  if (tasks.length === 0) return 0;
+  const now = Date.now();
+  const due = tasks.filter(task => task.dueAt <= now);
+  if (due.length === 0) return 0;
+  // 先摘出来再执行：执行可能很慢（触发 LLM），期间不能让它们被重复判定
+  saveDelayedTasks(tasks.filter(task => task.dueAt > now));
+
+  let fired = 0;
+  for (const task of due) {
+    const rule = loadBridgeRules().find(item => item.id === task.ruleId);
+    if (!rule || !rule.enabled) {
+      appendBridgeFeed({
+        id: task.id,
+        type: task.item.type,
+        payload: task.item.payload.slice(0, 2000),
+        rules: [task.ruleName],
+        actions: [rule ? "规则已停用，延迟任务取消" : "规则已删除，延迟任务取消"],
+        receivedAt: new Date().toISOString(),
+      });
+      continue;
+    }
+    try {
+      const actions = await runActions(rule, task.item, task.text);
+      appendBridgeFeed({
+        id: task.id,
+        type: task.item.type,
+        payload: task.item.payload.slice(0, 2000),
+        processed: task.text !== task.item.payload ? task.text.slice(0, 2000) : undefined,
+        rules: [rule.name],
+        actions: actions.length > 0 ? actions : ["延迟执行"],
+        receivedAt: new Date().toISOString(),
+      });
+      fired += 1;
+    } catch (err) {
+      appendBridgeFeed({
+        id: task.id,
+        type: task.item.type,
+        payload: task.item.payload.slice(0, 2000),
+        rules: [rule.name],
+        actions: [],
+        error: err instanceof Error ? err.message : String(err),
+        receivedAt: new Date().toISOString(),
+      });
+      console.warn("[现实桥] 延迟任务执行失败", rule.name, err);
+    }
+  }
+  return fired;
+}
+
+// ── 定时触发 ──
+
+/**
+ * 这条定时规则现在该不该跑。
+ *
+ * daily / weekly 的判定用「今天（本周）的那个时刻」当基准：
+ * 过了点、且上次跑的时间早于这个基准，才算该跑。这样一天只会命中一次，
+ * 而不是每轮轮询都触发一遍。App 关了几天再打开，最多补跑一次——
+ * 补三次「早安」比漏掉更糟。
+ */
+function isScheduleDue(
+  rule: BridgeRule,
+  now: Date,
+  lastRunAt: number,
+): boolean {
+  const schedule = rule.schedule;
+  if (!schedule) return false;
+
+  if (schedule.kind === "interval") {
+    const minutes = Math.max(1, Math.min(10080, Number(schedule.minutes) || 0));
+    return now.getTime() - lastRunAt >= minutes * 60_000;
+  }
+
+  const matched = /^(\d{1,2}):(\d{2})$/.exec(schedule.time || "");
+  if (!matched) return false;
+  const hour = Number(matched[1]);
+  const minute = Number(matched[2]);
+  if (hour > 23 || minute > 59) return false;
+
+  const target = new Date(now);
+  target.setHours(hour, minute, 0, 0);
+  if (schedule.kind === "weekly") {
+    const weekday = Math.max(0, Math.min(6, Number(schedule.weekday) || 0));
+    // 回退到本周对应的那一天（今天就是那天时 diff=0）
+    target.setDate(target.getDate() - ((now.getDay() - weekday + 7) % 7));
+  }
+  if (now.getTime() < target.getTime()) return false;
+
+  // 建好规则时今天这个点已经过了：不补触发，否则「下午建一条早八点的规则」
+  // 会立刻蹦出来执行一次，看着像 bug。
+  const createdAtMs = Date.parse(rule.createdAt) || 0;
+  if (lastRunAt <= 0 && createdAtMs > target.getTime()) return false;
+
+  return lastRunAt < target.getTime();
+}
+
+/**
+ * 跑一遍所有到点的定时规则。调度器每轮轮询调一次。
+ *
+ * @returns 本次真正触发的规则数（调度器据此决定要不要刷新界面）
+ */
+export async function runDueScheduledRules(): Promise<number> {
+  const rules = loadBridgeRules().filter(rule => rule.enabled && rule.schedule);
+  if (rules.length === 0) return 0;
+
+  let fired = 0;
+  for (const rule of rules) {
+    const now = new Date();
+    if (!isScheduleDue(rule, now, getBridgeRuleLastRunAt(rule.id))) continue;
+
+    // 造一个「凭空来的」信号：定时规则的动作里 {payload} 没有真实数据可填，
+    // 用规则名当 payload，至少 WriteChat 写出来的内容是可读的。
+    const item: BridgeItem = {
+      id: `schedule_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      type: rule.name || "定时联动",
+      payload: rule.name || "定时触发",
+      createdAt: now.toISOString(),
+    };
+
+    // 先记运行时间：动作可能触发 LLM 生成（几十秒），期间不能让它被重复判定。
+    markBridgeRuleRun(rule.id);
+    try {
+      const text = await processText(rule, item);
+      const actions = await runActions(rule, item, text);
+      appendBridgeFeed({
+        id: item.id,
+        type: item.type,
+        payload: item.payload,
+        processed: text !== item.payload ? text.slice(0, 2000) : undefined,
+        rules: [rule.name],
+        actions: actions.length > 0 ? actions : ["定时触发"],
+        receivedAt: new Date().toISOString(),
+      });
+      fired += 1;
+    } catch (err) {
+      appendBridgeFeed({
+        id: item.id,
+        type: item.type,
+        payload: item.payload,
+        rules: [rule.name],
+        actions: [],
+        error: err instanceof Error ? err.message : String(err),
+        receivedAt: new Date().toISOString(),
+      });
+      console.warn("[现实桥] 定时联动执行失败", rule.name, err);
+    }
+  }
+  return fired;
+}
+
+/**
+ * 试跑一条规则：立刻把它的「加工 → 动作」链路真的跑一遍，让用户在保存前
+ * 就能看见会发生什么。
+ *
+ * 为什么不能直接复用 processBridgeItem：
+ *   · 它按信号名从已保存的规则里挑，而向导里这条规则**还没保存**；
+ *   · 它把定时规则整个排除在外（那些由 runDueScheduledRules 触发），
+ *     于是「每天 8 点说早安」这种最常配的规则反而最没法验证。
+ * 所以这里直接吃一条明确的规则对象 + 一份示例数据。
+ *
+ * 副作用是真的：动作照常执行（该写聊天就写、该弹通知就弹）——这正是「测试」
+ * 的意义，用户要看到的就是真实效果。但**不写接收记录、不占用触发间隔**，
+ * 免得测试数据把历史弄脏、或把冷却时间白白占掉。
+ */
+/** 试跑结果：除了「跑出了什么」，更要回答「这条规则到底会不会被触发」。 */
+export type RuleTestOutcome = {
+  /** 匹配这一关过了没有。false 时 processed / actions 都是空的。 */
+  matched: boolean;
+  /** 链路里发生过、但用户看不见的环节（过滤、间隔、延迟）的说明。 */
+  notes: string[];
+  processed: string;
+  actions: string[];
+  error?: string;
+};
+
+export async function testRunRule(
+  rule: BridgeRule,
+  sample: { type: string; payload: string },
+): Promise<RuleTestOutcome> {
+  const item: BridgeItem = {
+    id: `test_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+    type: sample.type,
+    payload: sample.payload,
+    createdAt: new Date().toISOString(),
+  };
+  const notes: string[] = [];
+
+  // ① 匹配：**这一步原来是漏掉的**，也正是「试跑像空跑」的原因。
+  //    老实现无条件执行加工与动作，于是信号名填错、过滤词写偏，试跑照样跑得通，
+  //    用户以为配好了；等真信号来了却一条都不触发——最坑的那种「配了没用」。
+  //    试跑必须把这一关也走一遍，否则它验证的只是「动作能不能执行」，
+  //    而不是「这条规则会不会被触发」，后者才是用户真正担心的。
+  if (!rule.schedule) {
+    const wanted = rule.matchType.trim();
+    if (wanted && wanted !== "*" && wanted !== item.type) {
+      return {
+        matched: false,
+        notes: [`信号名对不上：规则等的是「${wanted}」，你试的是「${item.type}」。真的收到「${wanted}」时才会触发。`],
+        processed: "",
+        actions: [],
+      };
+    }
+    if (!matchesPayloadFilter(rule.payloadFilter, item.payload)) {
+      return {
+        matched: false,
+        notes: [`正文过滤没通过：规则要求内容里含「${rule.payloadFilter}」，示例内容里没有。`],
+        processed: "",
+        actions: [],
+      };
+    }
+  } else {
+    notes.push("这是定时规则，不看信号名，到点自己跑。");
+  }
+
+  // ② 触发间隔：真实链路里间隔内的同信号只存档、不执行。
+  //    但试跑**刻意不拦**——否则用户刚触发过一次就再也试不了，而他想看的只是
+  //    「会执行什么」。这里只说一句，让他知道真实情况下可能被拦。
+  const cooldown = Math.max(0, Number(rule.cooldownMinutes) || 0);
+  if (cooldown > 0) {
+    notes.push(`真实触发时，${cooldown} 分钟内重复的同一信号只会存档、不再执行；试跑不受这条限制。`);
+  }
+
+  // ③ 延迟执行：链路里会先排队、到点再跑。试跑不能真的等，所以立刻执行，
+  //    同时把「本该延后多久」如实说出来——不然用户会以为延迟没生效。
+  const delay = Math.max(0, Number(rule.delayMinutes) || 0);
+  if (delay > 0) {
+    notes.push(`真实触发时会先排队 ${delay} 分钟再执行；试跑是立刻跑的。`);
+  }
+
+  try {
+    const text = await processText(rule, item);
+    const actions = await runActions(rule, item, text);
+    return { matched: true, notes, processed: text, actions };
+  } catch (err) {
+    return {
+      matched: true,
+      notes,
+      processed: "",
+      actions: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }

@@ -16,6 +16,8 @@ import {
   type BridgeShortcutAction,
 } from "./reality-bridge/storage";
 import { loadWeixinBots } from "./weixin-storage";
+import { loadPerceptionConfig } from "./perception/storage";
+import { readLocalStatusForOffline } from "./perception/cloud-sync";
 
 export type OfflineShortcutAction = {
   actionId: string;
@@ -152,6 +154,25 @@ export function maybeAppendWeixinChannel(llmMessages: LLMMessage[], characterId:
       + "不合适就不要输出，也不要提及本条说明。）",
   });
   return botId;
+}
+
+/**
+ * 快照注入：把「用户手机当前状态」告诉即将离线生成的角色。
+ *
+ * 只有当用户开了感知总开关 + 云端同步开关（cloudSyncEnabled）时才注入——
+ * 那是他明确同意把状态送上云的意思。默认关，所以这段默认不出现。
+ * 数据在新旧上都做了保护（readLocalStatusForOffline 里超过 6 小时不返回）。
+ */
+export function maybeAppendPerceptionStatus(llmMessages: LLMMessage[]): void {
+  const config = loadPerceptionConfig();
+  if (!config.enabled || !config.cloudSyncEnabled) return;
+  const text = readLocalStatusForOffline();
+  if (!text) return;
+  llmMessages.push({
+    role: "system",
+    content: `（可选背景：${text}这是你离线时对 TA 处境的印象，不用刻意提起；`
+      + "如果不确定或已经过时，就当不知道。）",
+  });
 }
 
 /** 把动作的参数 schema 压成一句人话，让角色知道括号里该写什么。无参数返回空串。 */

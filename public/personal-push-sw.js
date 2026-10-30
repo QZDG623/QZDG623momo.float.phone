@@ -74,6 +74,20 @@ self.addEventListener("notificationclick", (event) => {
         });
       }
       client.postMessage({ type: "push_outbox_ready" });
+      // 普通消息通知带会话深链（url 形如 /#open-chat=<id>）：已有窗口时也要导航过去，
+      // 否则点通知只把页面唤到前台、停在原来那一页。navigate 由页面内的
+      // #open-chat 消费端接管开对应会话。
+      const target = typeof data.url === "string" ? data.url : "";
+      if (target && !target.startsWith("blob:")) {
+        const absolute = new URL(target, self.location.origin).toString();
+        try {
+          if ("navigate" in client && typeof client.navigate === "function") {
+            await client.navigate(absolute);
+          } else {
+            client.postMessage({ type: "navigate", url: target });
+          }
+        } catch { /* navigate 失败不影响 focus */ }
+      }
       return client.focus();
     }
     return self.clients.openWindow(data.url || "/");

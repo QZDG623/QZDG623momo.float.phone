@@ -6,9 +6,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-    resolveCloudSttConfig,
     startCallRecording,
-    transcribeAudioBlob,
+    transcribeAudioBlobWithFallback,
     type ActiveCallRecording,
 } from "@/lib/stt-cloud";
 
@@ -105,9 +104,7 @@ export function useHoldToTalk(options: HoldToTalkOptions): HoldToTalkHandle {
         try {
             const blob = await recording.stop();
             if (!blob) { fail("没有录到声音"); return; }
-            const config = resolveCloudSttConfig(optionsRef.current.characterId);
-            if (!config) { fail("未找到可用的语音识别配置"); return; }
-            const text = await transcribeAudioBlob(blob, config);
+            const text = await transcribeAudioBlobWithFallback(blob, optionsRef.current.characterId);
             if (!mountedRef.current) return;
             setRecState("idle");
             if (!text.trim()) { fail("没有识别到内容"); return; }

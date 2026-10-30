@@ -2,6 +2,45 @@
 
 import { useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
+import { downloadFile } from "@/lib/download-utils";
+import { isMediaStoreRef, loadMediaBlob } from "@/lib/media-cache-storage";
+
+/** 从 data:image/...;base64,xxx 解析出 Mime 与字节 */
+function dataUrlToBlob(dataUrl: string): Blob | null {
+    const comma = dataUrl.indexOf(",");
+    if (comma < 0) return null;
+    const meta = dataUrl.slice(5, comma); // 去掉开头的 "data:"
+    const payload = dataUrl.slice(comma + 1);
+    const mime = (meta.split(";")[0] || "application/octet-stream").trim() || "application/octet-stream";
+    try {
+        if (/;base64/i.test(meta)) {
+            const bin = atob(payload);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+            return new Blob([bytes], { type: mime });
+        }
+        return new Blob([decodeURIComponent(payload)], { type: mime });
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * 把预览里的图片地址解析成可落盘的真实字节。
+ *
+ * 聊天里的 AI 生图、语音等存的是 media-store:// 引用，也有内联 data: 地址；
+ * 直接丢给 downloadUrl 会先 fetch → 失败 → 退回 window.open，
+ * 在安卓壳里对 blob/data 地址发 ACTION_VIEW 什么都不会发生（"点了没反应"）。
+ * 所以这里先把已知的特殊地址解析成 Blob，其余（http(s) 直链）才交给 downloadUrl。
+ */
+async function resolvePreviewBlob(url: string): Promise<Blob | null> {
+    if (url.startsWith("data:")) return dataUrlToBlob(url);
+    if (isMediaStoreRef(url)) {
+        const found = await loadMediaBlob(url).catch(() => null);
+        return found ? found.blob : null;
+    }
+    return null;
+}
 
 const ACTION_BUTTON_STYLE: CSSProperties = {
     color: "#fff",
@@ -76,8 +115,15 @@ export function MediaPreviewOverlay({
                             e.preventDefault();
                             setSaving(true);
                             try {
-                                const { downloadUrl } = await import("@/lib/download-utils");
-                                await downloadUrl(imageUrl, saveFilename);
+                                // media-store:// / data: 先解析成真实字节再落盘；
+                                // 其余（http(s) 直链）沿用 downloadUrl。
+                                const blob = await resolvePreviewBlob(imageUrl);
+                                if (blob) {
+                                    await downloadFile(blob, saveFilename);
+                                } else {
+                                    const { downloadUrl } = await import("@/lib/download-utils");
+                                    await downloadUrl(imageUrl, saveFilename);
+                                }
                             } finally {
                                 setSaving(false);
                             }

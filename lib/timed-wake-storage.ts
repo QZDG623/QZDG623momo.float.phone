@@ -1,3 +1,5 @@
+import { emitBailoutCancel } from "./bailout-cancel";
+import { markBailoutDirty } from "./bailout-dirty";
 import { kvGet, kvSet, registerKvMigration } from "./kv-db";
 
 export const TIMED_WAKE_SCHEDULES_KEY = "ai_phone_timed_wake_schedules_v1";
@@ -35,6 +37,9 @@ export function loadTimedWakeSchedules(): TimedWakeSchedule[] {
 function saveTimedWakeSchedules(schedules: TimedWakeSchedule[]): void {
     if (typeof window === "undefined") return;
     kvSet(TIMED_WAKE_SCHEDULES_KEY, JSON.stringify(schedules));
+    // 排期一变就请监听方立刻把任务挂到服务端——不能等到「启动 20 秒后」或
+    // 「切后台」那两个时点才组装上传，否则新建后很快退出/被杀会整单丢失。
+    markBailoutDirty();
 }
 
 export function saveTimedWakeSchedule(schedule: TimedWakeSchedule): void {
@@ -45,11 +50,17 @@ export function saveTimedWakeSchedule(schedule: TimedWakeSchedule): void {
 }
 
 export function clearTimedWakeSchedule(sessionId: string): void {
+    // 先取出被清掉的条目，逐个撤销服务端预约——只改本地会让那条已经挂上去的
+    // 任务照常在原定时刻触发，用户看到「已经取消了，通知还是弹了」。
+    const removing = loadTimedWakeSchedules().filter(item => item.sessionId === sessionId);
     saveTimedWakeSchedules(loadTimedWakeSchedules().filter(item => item.sessionId !== sessionId));
+    for (const item of removing) emitBailoutCancel({ key: `timedwake:${item.id}` });
 }
 
 export function removeTimedWakeSchedule(id: string): void {
     saveTimedWakeSchedules(loadTimedWakeSchedules().filter(item => item.id !== id));
+    // 同上：本地删除必须同步撤销服务端预约。
+    emitBailoutCancel({ key: `timedwake:${id}` });
 }
 
 function isTimedWakeSchedule(value: unknown): value is TimedWakeSchedule {

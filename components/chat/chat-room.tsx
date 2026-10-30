@@ -5,7 +5,7 @@ import { ChatSession, ChatMessage, CHAT_APP_SETTINGS_UPDATED_EVENT, CHAT_INITIAL
 import { cleanStreamText, splitStreamPreviewSegments, stripLiteralTexts, stripXmlTagBlocks } from "@/lib/stream-preview";
 import type { StateValue } from "@/lib/chat-storage";
 import { parseStateValues, mergeStateValues } from "@/lib/state-value-parser";
-import { parseAIResponse, type ParsedMessagePart } from "@/lib/rich-message-parser";
+import { parseAIResponse, isNonDialogueOnlyContent, type ParsedMessagePart } from "@/lib/rich-message-parser";
 import { isKnownStickerLabel } from "@/lib/sticker-data";
 import { translateReasoningText } from "@/lib/reasoning-translate";
 import { MessageBubble, MediaDetailModal, prewarmStickerCache, BilingualTextBlock, isStandaloneHtmlPreviewContent, normalizeTextBubbleContent } from "./message-bubble";
@@ -36,9 +36,10 @@ import { CustomAppRunner } from "@/components/app-market/custom-app-runner";
 import { CustomAppForegroundBoundary } from "@/components/app-market/custom-app-failure";
 
 import { ChatSettingsPanel } from "./chat-settings-panel";
-import { VoiceCallScreen } from "./voice-call-screen";
-import { VideoCallScreen } from "./video-call-screen";
-import { GroupCallScreen } from "./group-call-screen";
+// 通话界面不再由聊天室渲染：已提升到 desktop-shell 的 CallLayer，
+// 这样切会话、回桌面、开别的 App 都不会中断通话。聊天室只负责「发起」；
+// 挂断后的界面刷新由 chat-call-ended 事件回调，角色回应由全局层统一触发。
+import { startCall } from "@/lib/call-session-store";
 import { TransferTargetModal } from "./transfer-target-modal";
 import { GiftPickerModal } from "./gift-picker-modal";
 import { ConfirmDialog } from "@/components/ui/modal";
@@ -53,7 +54,7 @@ import { useKeyboardDismissAutoSend } from "@/components/chat/use-keyboard-dismi
 import { cancelBailoutKey } from "@/lib/push-bailout-client";
 import { PENDING_REPLY_PREFIX } from "@/lib/friend-request-engine";
 import type { UserIdentity } from "@/components/settings/user-identity";
-import { AlertCircle, Blocks, Bookmark, Check, Trash2, User, ChevronLeft, ChevronRight, Clapperboard, Clock, Gift, Languages, Loader2, MoreHorizontal, X } from "lucide-react";
+import { AlertCircle, Blocks, Check, Trash2, User, ChevronLeft, ChevronRight, Clapperboard, Clock, Drama, Gift, Languages, Loader2, MoreHorizontal, X } from "lucide-react";
 import { setDebugChatState } from "@/lib/debug-store";
 import { SessionCustomCSS } from "@/components/ui/session-custom-css";
 import { setChatActive } from "@/lib/music-action-queue";
@@ -185,9 +186,15 @@ const OfflineAssistantTextBlock = memo(function OfflineAssistantTextBlock({
     text: string;
     defaultExpanded: boolean;
 }) {
-    const paragraphs = useMemo(() => splitOfflineParagraphs(text), [text]);
-    if (paragraphs.length <= 1) {
-        return <BilingualTextBlock text={text} mode="markdown" defaultExpanded={defaultExpanded} htmlFrameVariant="offline" />;
+    // 线下模式是独立渲染路径（不走 MessageBubble），过去直接把原始正文丢给 Markdown：
+    // 模型写在气泡里的灰色旁白 HTML、`(breath)` 之类 Sound Tag 会原样显示。
+    // 这里逐段清洗，纯旁白段直接丢掉——整条都是旁白时返回 null，不占位。
+    const paragraphs = useMemo(() => splitOfflineParagraphs(text)
+        .map(paragraph => normalizeTextBubbleContent(paragraph))
+        .filter(Boolean), [text]);
+    if (paragraphs.length === 0) return null;
+    if (paragraphs.length === 1) {
+        return <BilingualTextBlock text={paragraphs[0]} mode="markdown" defaultExpanded={defaultExpanded} htmlFrameVariant="offline" />;
     }
     return (
         <div className="chat-offline-paragraph-stack">
@@ -303,6 +310,24 @@ function reasoningPreviewLine(text: string): string {
 
 function isHiddenChatFlowMessage(msg: ChatMessage, displayContent?: string): boolean {
     if (msg.mediaType === "tool_result" || msg.mediaType === "tool_call") return true;
+    // 纯旁白/动作/音效指令（非台词）整条不显示：角色的神态、动作、Sound Tag 不是
+    // 说出口的话，留在聊天里只会是一串灰色乱码，还会被语音当成台词念出来。
+    // 只对纯文本与语音条生效——卡片类富媒体气泡的内容本来就为空，别误伤。
+    // 状态栏/内心独白/思维链挂在这条消息上时仍要显示，否则面板会跟着消失。
+    const plainOrVoice = !msg.mediaType || msg.mediaType === "audio";
+    const rawContent = displayContent ?? msg.content;
+    // 语音条的正文字段是空的，要念的内容都在 mediaData.label 里——判"是不是纯旁白"
+    // 必须看 label，否则 `[语音条:(breath)]` 这种会留下一个不会说话的语音气泡。
+    const speechSource = msg.mediaType === "audio" ? (msg.mediaData?.label || rawContent) : rawContent;
+    if (msg.role !== "user"
+        && plainOrVoice
+        && !msg.statusPanel
+        && !msg.innerMonologue
+        && !msg.reasoningText
+        && isNonDialogueOnlyContent(speechSource)
+        && !isStandaloneHtmlPreviewContent(rawContent)) {
+        return true;
+    }
     return !isChatVisualMedia(msg)
         && !getChatFlowVisibleContent(msg, displayContent)
         && uiRole(msg) !== "system"
@@ -479,6 +504,51 @@ function cancelOfflineGenerationRun(sessionId: string): boolean {
 // ── Rich media reprocessing on mount ──────────────────────────
 
 const TIME_GAP = 1 * 60 * 1000;
+
+/**
+ * 通话分组的兜底边界：相邻两条消息间隔超过它，就认为这次通话已经结束。
+ *
+ * 为什么需要：通话被意外中断（App 被杀、崩溃、强杀）时不会写「挂断」留痕，
+ * 旧的配对逻辑找不到终点，endIdx 停在 -1，整段通话散开、折不起来，
+ * 连「N条消息」都看不到。用时间断层兜底后，没有挂断记录也能折起来。
+ *
+ * 取舍：调大 → 断线后马上又聊的内容会被一起折进去；调小 → 长通话中途长时间
+ * 静音（挂着不说话）会被切成两段。
+ */
+const CALL_GROUP_MAX_GAP_MS = 60 * 60 * 1000;
+
+/**
+ * 兜底扫描里，普通对话（角色消息、工具卡片）延续通话的间隔上限。
+ *
+ * 为什么需要它、且必须比 CALL_GROUP_MAX_GAP_MS 小得多：
+ * 没有挂断留痕时，兜底扫描原本对「所有消息」一视同仁，只要相邻间隔不超 1 小时
+ * 就把边界一路往后推——结果是通话结束后整整一小时内的聊天室消息、卡片全被
+ * 吸进通话分组（用户实报：正常聊天的内容都被折进去了）。
+ *
+ * 这里区分两类消息：
+ *   · 系统留痕（发起/接听/挂断…）→ 用 CALL_GROUP_MAX_GAP_MS，容忍长静默
+ *   · 普通对话 → 只有紧邻（间隔小于本阈值）才算通话期间，否则视为通话已结束
+ * 通话期间对话通常一问一答很密，10 分钟足够；通话结束后开始闲聊时，第一条
+ * 通常已经隔了更久，于是正确断开，不再误吞。
+ */
+const CALL_GROUP_CHAT_GAP_MS = 10 * 60 * 1000;
+
+/**
+ * 把 ISO 时间字符串解析成毫秒时间戳；空值 / 非法值一律返回 0。
+ *
+ * 为什么带一份自己的：chat-room 此前没有这个工具（同名函数定义在
+ * chat-message-list.tsx 内部，模块间不共享）。通话分组的兜底扫描直接引用
+ * 会抛 ReferenceError，整个聊天室白屏（用户实报的 client-side exception）。
+ *
+ * 刻意不叫 parseTime：那个名字在其它文件用过，万一将来这个文件上层也引入
+ * 一份同名声明，函数声明与它同作用域会直接语法报错（重复声明），白屏比这次
+ * 还难查。取个独占的名字从源头杜绝。
+ */
+function parseCallTime(value?: string | null): number {
+    if (!value) return 0;
+    const time = new Date(value).getTime();
+    return Number.isNaN(time) ? 0 : time;
+}
 
 function shouldShowTimestamp(currentMsg: string, prevMsg: string | null): boolean {
     if (!prevMsg) return true; // First message always shows time
@@ -697,9 +767,10 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
 }, ref) {
     const [inputText, setInputText] = useState("");
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
     // 表情包搜索联想：ESC/失焦置 true 隐藏，输入变化重新开启
     const [suggestClosed, setSuggestClosed] = useState(false);
-    // 围观群/被禁言：输入与富媒体入口全部锁定，只留线下切换和生成按钮
+    // 围观群/被禁言：输入与富媒体入口全部锁定，只留生成按钮
     const [muteNowTick, setMuteNowTick] = useState(() => Date.now());
     useEffect(() => {
         if (!muteUntilMs || muteUntilMs <= Date.now()) return;
@@ -753,6 +824,7 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
     );
     const suggestEnabled = !inputLocked && !panelOpen && !suggestClosed && inputText.trim().length > 0;
     const plusMenuItems = [
+        { icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--c-text)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 0 1 18 0Z" /><circle cx="12" cy="10" r="3" /></svg>, label: "线下模式", onClick: () => { onToggleOfflineMode(); onClosePanels(); } },
         { icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--c-text)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" /></svg>, label: "照片墙", onClick: () => onOpenRichModal("photo") },
         { icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--c-text)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><line x1="7" y1="8" x2="17" y2="8" /><line x1="7" y1="12" x2="14" y2="12" /><line x1="7" y1="16" x2="11" y2="16" /></svg>, label: "文字图片", onClick: () => onOpenRichModal("text_photo") },
         { icon: <AlertCircle size={22} strokeWidth={1.5} color="var(--c-text)" />, label: "系统指令", onClick: () => onOpenRichModal("system_instruction") },
@@ -853,15 +925,17 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
 
             <div className="chat-input-actions">
                 <button
-                    onClick={onToggleOfflineMode}
-                    className="ui-bare-btn text-[var(--c-text)] chat-offline-toggle"
-                    aria-label={storyEntryEnabled ? "剧情入口" : "线下模式"}
-                    title={storyEntryEnabled ? "剧情入口" : "线下模式"}
+                    type="button"
+                    onClick={() => {
+                        // 一键跳转剧情 APP（与桌面点「剧情」图标等价）。线下模式已挪进加号下拉栏。
+                        onClosePanels();
+                        window.dispatchEvent(new CustomEvent("open-app", { detail: { appId: "story" } }));
+                    }}
+                    className="ui-bare-btn text-[var(--c-text)]"
+                    aria-label="剧情"
+                    title="剧情"
                 >
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                        <path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 0 1 18 0Z" />
-                        <circle cx="12" cy="10" r="3" />
-                    </svg>
+                    <Drama size={24} strokeWidth={1.5} />
                 </button>
                 <button onClick={onToggleEmojiPanel} disabled={inputLocked} className="ui-bare-btn text-[var(--c-text)]" style={inputLocked ? { opacity: 0.35 } : undefined}>
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><path d="M8 14s1.5 2 4 2 4-2 4-2" /><line x1="9" y1="9" x2="9.01" y2="9" /><line x1="15" y1="9" x2="15.01" y2="9" /></svg>
@@ -874,6 +948,8 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
                 </button>
                 <button
                     onClick={handleSubmit}
+                    onPointerDown={(e) => e.preventDefault()}
+                    tabIndex={-1}
                     disabled={!isGenerating && (inputLocked || !inputText.trim())}
                     style={inputLocked && !isGenerating ? { opacity: 0.35 } : undefined}
                     className="ui-bare-btn text-[var(--c-text)]"
@@ -893,6 +969,8 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
                     <button
                         className="ui-bare-btn text-[var(--c-text)]"
                         title={!inputLocked && inputText.trim() ? "发送输入框内容并触发回复" : "触发 AI 主动回复"}
+                        onPointerDown={(e) => e.preventDefault()}
+                        tabIndex={-1}
                         onClick={() => {
                             const trimmed = inputText.trim();
                             // 输入框已有文字：发送输入框内容并立即触发模型回复（一次按键完成），
@@ -1090,6 +1168,8 @@ const OfflineTextInputBar = memo(forwardRef<OfflineTextInputHandle, {
                 <button
                     type="button"
                     onClick={() => { if (isOfflineGenerating) onStopGeneration(); else handleSubmit(); }}
+                    onPointerDown={(e) => e.preventDefault()}
+                    tabIndex={-1}
                     disabled={!isOfflineGenerating && !isSpectator && !inputText.trim()}
                     className="ui-bare-btn text-[var(--c-text)]"
                     aria-label={isOfflineGenerating ? "停止线下生成" : "发送"}
@@ -1159,11 +1239,7 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
     const [customPlusActions, setCustomPlusActions] = useState<RegisteredCustomAppChatPlusAction[]>(() => loadCustomAppChatPlusActions());
     const [activeCustomChatPlus, setActiveCustomChatPlus] = useState<ActiveCustomChatPlus | null>(null);
     const [showSettings, setShowSettings] = useState(false);
-    const [showVoiceCall, setShowVoiceCall] = useState(false);
-    const [showVideoCall, setShowVideoCall] = useState(false);
-    const [callMinimized, setCallMinimized] = useState(false);
-    const [callInitiator, setCallInitiator] = useState<"user" | "character">("user");
-    const [callInitiatorName, setCallInitiatorName] = useState<string>("");
+    // 通话状态已提升到全局 store（lib/call-session-store），聊天室不再持有。
     const [userIdentity, setUserIdentity] = useState<UserIdentity | null>(null);
     const [enterToSendEnabled, setEnterToSendEnabled] = useState(() => loadChatAppSettings().enterToSendEnabled === true);
     const [storyEntryEnabled, setStoryEntryEnabled] = useState(() => loadChatAppSettings().storyAsOfflineMode === true);
@@ -2173,9 +2249,14 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
             if (detail?.sessionId === session.id) {
                 // Only handle call if this ChatRoom is currently visible
                 if (!isChatRoomElementVisible(wrapperRef.current)) return;
-                setCallInitiator("character");
-                if (detail.type === "voice") setShowVoiceCall(true);
-                else if (detail.type === "video") setShowVideoCall(true);
+                startCall({
+                    sessionId: session.id,
+                    // 群聊通话没有单一角色，交由 CallLayer 按会话成员渲染
+                    characterId: session.isGroup ? "" : session.contactId,
+                    kind: detail.type === "video" ? "video" : "voice",
+                    initiator: "character",
+                    ...(typeof detail.characterName === "string" ? { initiatorName: detail.characterName } : {}),
+                });
                 // Dismiss the global incoming-call bar (if showing)
                 window.dispatchEvent(new CustomEvent("incoming-call-dismiss"));
             }
@@ -3176,9 +3257,12 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
     // Helper: handle AI-triggered call from splitAndSaveAIMessages result
     const handleCallTrigger = (triggerCall?: "voice" | "video") => {
         if (!triggerCall) return;
-        setCallInitiator("character");
-        if (triggerCall === "voice") setShowVoiceCall(true);
-        else setShowVideoCall(true);
+        startCall({
+            sessionId: session.id,
+            characterId: session.isGroup ? "" : session.contactId,
+            kind: triggerCall,
+            initiator: "character",
+        });
     };
 
     const persistHiddenToolResult = (content?: string, toolExecutionId?: string) => {
@@ -5238,20 +5322,49 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
         return "displaySourceId" in msg && msg.displaySourceId ? msg.displaySourceId : msg.id;
     };
 
-    const favoriteStoredMessages = async (messageIds: string[]) => {
-        const targets = new Set(messageIds);
-        const storedMessages = loadChatMessages(session.id).filter(message => targets.has(message.id));
-        if (storedMessages.length === 0) {
-            showChatToast("没有找到可收藏的消息");
-            return;
-        }
-        try {
-            await addChatFavorite({ session, messages: storedMessages });
-            showChatToast(storedMessages.length > 1 ? `已收藏 ${storedMessages.length} 条消息` : "已收藏");
-        } catch (error) {
-            showChatToast(error instanceof Error ? error.message : "收藏失败");
-        }
-    };
+    /**
+     * 手动标记 / 取消「通话结尾」。
+     *
+     * 为什么需要手动：自动配对依赖「发起」与「挂断」两条留痕，而超长通话里
+     * 「发起」常被挤出加载窗口（默认只加载最近 50 条），或者通话被意外中断
+     * 根本没写挂断——两种情况下自动扫描都折不起来，用户也就看不到「N条消息」。
+     * 手动标一条结尾，折叠逻辑就有了确定的锚点，不必再猜。
+     *
+     * 标记存在消息自身的 mediaData 上（不另开一张表）：删掉这条消息标记自然消失，
+     * 导出备份也会跟着走，不需要额外的清理逻辑。
+     */
+    const toggleCallEndMarker = useCallback((msg: ChatMessage | RenderChatMessage) => {
+        const id = getStoredActionMessageId(msg);
+        const target = loadChatMessages(session.id).find(m => m.id === id);
+        if (!target) return;
+        const nextData = { ...(target.mediaData || {}) };
+        const marking = nextData.callEndMarker !== true;
+        if (marking) nextData.callEndMarker = true;
+        else delete nextData.callEndMarker;
+        updateMessageMediaData(id, nextData);
+        syncMessagesFromStorage();
+        showChatToast(marking ? "已标记为通话结尾" : "已取消通话结尾标记");
+    }, [session.id, syncMessagesFromStorage]);
+
+    /**
+     * 手动标记 / 取消「通话开头」。
+     *
+     * 与结尾标记配对使用：老通话的「发起了语音通话」留痕可能已经不在（被删、
+     * 或从未写入），只靠留痕永远找不到起点、整段折不起来。手动标一条作为开头，
+     * 配合结尾标记就能把任意一段手工圈成通话。
+     */
+    const toggleCallStartMarker = useCallback((msg: ChatMessage | RenderChatMessage) => {
+        const id = getStoredActionMessageId(msg);
+        const target = loadChatMessages(session.id).find(m => m.id === id);
+        if (!target) return;
+        const nextData = { ...(target.mediaData || {}) };
+        const marking = nextData.callStartMarker !== true;
+        if (marking) nextData.callStartMarker = true;
+        else delete nextData.callStartMarker;
+        updateMessageMediaData(id, nextData);
+        syncMessagesFromStorage();
+        showChatToast(marking ? "已标记为通话开头" : "已取消通话开头标记");
+    }, [session.id, syncMessagesFromStorage]);
 
     /** Reusable context menu for user/assistant bubbles */
     const renderBubbleContextMenu = (m: ChatMessage, options?: { allowMultiSelect?: boolean }) => {
@@ -5298,6 +5411,12 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
                             <button onClick={() => { setInstructionRetryTargetId(storedMessageId); setInstructionRetryDraft(""); setActiveMessageId(null); }} className="ctx-menu-btn">指令重试</button>
                         </>
                     )}
+                    <button onClick={() => { toggleCallStartMarker(m); setActiveMessageId(null); }} className="ctx-menu-btn">
+                        {m.mediaData?.callStartMarker ? "取消通话开头" : "设为通话开头"}
+                    </button>
+                    <button onClick={() => { toggleCallEndMarker(m); setActiveMessageId(null); }} className="ctx-menu-btn">
+                        {m.mediaData?.callEndMarker ? "取消通话结尾" : "设为通话结尾"}
+                    </button>
                 </div>
                 <div className="flex">
                     <button onClick={() => { setQuotingMessage(m); setActiveMessageId(null); }} className="ctx-menu-btn">引用</button>
@@ -5555,46 +5674,218 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
 
     // Build a map: startMsgId → { startIdx, endIdx, duration }
     // and a set of all message indices that belong to a voice call group
+    // 全量预计算：不看已渲染的那几十条，直接翻整个会话算出所有通话区间，
+    // 再映射回当前窗口。
+    //
+    // 为什么必须这样：聊天室默认只加载最近 50 条消息，而长通话（几小时、上千条）
+    // 的「发起语音通话」留痕早被挤出窗口。只扫窗口时找不到起点，整段折不起来，
+    // 连「N条消息」都看不到——用户实报的就是这个（手动往上翻把起点加载进来就正常了，
+    // 正是窗口截断的铁证）。
     const voiceCallGroups = useMemo(() => {
-        const groups: { startId: string; startIdx: number; endIdx: number; duration: string; callType: "voice" | "video" }[] = [];
-        const memberSet = new Set<number>();
+        type CallRange = {
+            startMsgId: string;
+            endMsgId: string;
+            duration: string;
+            callType: "voice" | "video";
+            interrupted: boolean;
+            /** 这段通话的对话条数（系统留痕不算），按全量记录统计 */
+            chatCount: number;
+            /** 这段通话包含的全部消息 id，用于映射回当前窗口 */
+            memberIds: Set<string>;
+        };
+        const ranges: CallRange[] = [];
+        const allStored = loadChatMessages(session.id).filter(m => !isReadingDiscussMessage(m));
 
         let i = 0;
-        while (i < projectedMessages.length) {
-            const msg = projectedMessages[i];
-            if (uiRole(msg) !== "system") { i++; continue; }
+        while (i < allStored.length) {
+            const msg = allStored[i];
+            // 起点两个来源：系统留痕「发起了语音/视频通话」，或用户手动标的
+            // 「通话开头」（右键菜单）。手动那个是救急用的——起点留痕被删掉、
+            // 或被挤出数据库的老通话，只靠留痕永远折不起来。
+            const isManualStart = msg.mediaData?.callStartMarker === true;
+            if (uiRole(msg) !== "system" && !isManualStart) { i++; continue; }
             // Detect call START precisely: "发起了语音通话" / "发起了视频通话"
             const isVoiceStart = msg.content.includes("发起了语音通话");
             const isVideoStart = msg.content.includes("发起了视频通话");
-            if (isVoiceStart || isVideoStart) {
-                const callType = isVideoStart ? "video" : "voice";
-                const kw = isVideoStart ? "视频通话" : "语音通话";
-                let endIdx = -1;
-                let duration = "";
-                for (let j = i + 1; j < projectedMessages.length; j++) {
-                    if (uiRole(projectedMessages[j]) !== "system") continue;
-                    const c = projectedMessages[j].content;
-                    // Another call start → separate call, stop
-                    if (c.includes("发起了语音通话") || c.includes("发起了视频通话")) break;
-                    // Call end: 挂断/拒绝/取消（兼容"群语音通话"/"群视频通话"）
-                    if (c.includes(`挂断了${kw}`) || c.includes(`挂断了群${kw}`) || c.includes(`拒绝了${kw}`) || c.includes(`拒绝了群${kw}`) || c.includes(`取消了${kw}`) || c.includes(`取消了群${kw}`)) {
-                        endIdx = j;
-                        const match = c.match(/时长\s*(\d+:\d+)/);
-                        duration = match ? match[1] : "";
-                        break;
+            if (isVoiceStart || isVideoStart || isManualStart) {
+                // 手动标的开头本身不带类型信息：往后扫一眼通话留痕定类型，
+                // 扫不到就按语音处理（只是个图标差异）。
+                let callType: "voice" | "video" = isVideoStart ? "video" : "voice";
+                if (isManualStart && !isVoiceStart && !isVideoStart) {
+                    for (let t = i + 1; t < allStored.length; t += 1) {
+                        const probe = allStored[t].content || "";
+                        if (probe.includes("发起了语音通话")) break;
+                        if (probe.includes("发起了视频通话")) { callType = "video"; break; }
                     }
                 }
+                const kw = callType === "video" ? "视频通话" : "语音通话";
+                // ── 终点判定：手动标记优先，其次挂断留痕 ──────────
+                //
+                // 扫描范围一直走到下一条「发起通话」为止，中途同时留意两件事：
+                //   · 手动标记的结尾（右键「设为通话结尾」）
+                //   · 自动写的挂断/拒绝/取消留痕
+                //
+                // 手动标记优先级更高：它是用户的明确意图，而挂断留痕可能是误留的
+                // （长通话挂了一夜忘了挂、或留痕与真实结束时刻差很远）。过去只把手动
+                // 标记当「挂断留痕不存在时的兜底」，于是用户标了也不生效（用户实报）。
+                // 仍不受「时间断层」影响：挂断留痕可能和上一条消息隔得很远，按时间
+                // 提前截断会漏掉真正终点，也会把聊天室消息圈进通话区间（用户实报）。
+                let endIdx = -1;
+                let duration = "";
+                let hookEndIdx = -1;      // 挂断留痕位置（手动标记不存在时启用）
+                let hookDuration = "";
+                for (let j = i + 1; j < allStored.length; j++) {
+                    const candidate = allStored[j];
+                    if (uiRole(candidate) === "system") {
+                        const c = candidate.content;
+                        // Another call start → separate call, stop
+                        if (c.includes("发起了语音通话") || c.includes("发起了视频通话")) break;
+                        // Call end: 挂断/拒绝/取消（兼容"群语音通话"/"群视频通话"）
+                        if (hookEndIdx === -1
+                            && (c.includes(`挂断了${kw}`) || c.includes(`挂断了群${kw}`)
+                                || c.includes(`拒绝了${kw}`) || c.includes(`拒绝了群${kw}`)
+                                || c.includes(`取消了${kw}`) || c.includes(`取消了群${kw}`))) {
+                            hookEndIdx = j;
+                            const match = c.match(/时长\s*(\d+:\d+)/);
+                            // 时长有两个来源，正文正则优先、mediaData 兜底。
+                            //
+                            // 单聊挂断消息的正文只有「[我挂断了语音通话]」，时长实际存在
+                            // mediaData.callDuration 里（通话屏落库时写入）——过去只扫正文，
+                            // 于是单聊时长永远取不到（用户实报「没有显示时长」）。
+                            // 群聊挂断把时长写进了正文，正则仍能命中。
+                            const fromMedia = candidate.mediaData?.callDuration;
+                            hookDuration = match ? match[1] : (typeof fromMedia === "string" ? fromMedia : "");
+                        }
+                    }
+                    // 手动标记的结尾：直接采用，不再继续往后扫。
+                    if (candidate.mediaData?.callEndMarker) { endIdx = j; break; }
+                }
+
+                if (endIdx === -1 && hookEndIdx !== -1) {
+                    endIdx = hookEndIdx;
+                    duration = hookDuration;
+                } else if (endIdx !== -1) {
+                    // 用手动标记收尾时，时长仍取区间内那条挂断留痕写下的值。
+                    duration = hookDuration;
+                }
+                const interrupted = endIdx === -1;
+
+                // 时间断层兜底已移除：通话边界只认上面这两个明确来源，
+                // 两者都没有时 endIdx 仍为 -1，下面不会折叠任何东西。
+
+                // 时间断层兜底已移除。
+                //
+                // 它按消息间隔猜「通话什么时候结束」，把通话期间在聊天室发的消息
+                // 也圈进了通话区间（用户实报「聊天室消息全被归为通话记录」）。
+                // 现在通话边界只认两个明确来源：挂断留痕、用户手动标记的结尾。
+                // 两者都没有时 endIdx 仍为 -1，下面不会折叠任何东西。
+
                 if (endIdx > i) {
-                    groups.push({ startId: msg.id, startIdx: i, endIdx, duration, callType });
-                    for (let k = i; k <= endIdx; k++) memberSet.add(k);
+                    // 只收「通话产生的消息」，判定逐条进行：
+                    //   · origin === "call"  —— 通话屏里的对话轮、用户从通话界面发的
+                    //   · origin 不存在        —— 老版本记录（origin 是后加字段，那时不写）
+                    //   · isCallSysMsg        —— 通话留痕（发起了/挂断了）本身
+                    // 其余来源（origin 为 chat / custom_app / reading_discuss 等）
+                    // 一律留在时间流，不折进通话里。
+                    //
+                    // 为什么必须逐条、不能整段判：origin 是后加的字段，一通老通话里
+                    // 几十条消息全是无标记的。原先只要区间里出现「任意一条」带标记的
+                    // 消息就整段切严格模式，于是这些老消息被连坐排除——整通电话折成
+                    // 「共0条」，内容全露在外面（用户实报）。逐条判定后，老消息照收，
+                    // 同区间里的新版聊天室消息仍被排除，两头都不误伤。
+                    const memberIds = new Set<string>();
+                    let chatCount = 0;
+                    for (let k = i; k <= endIdx; k += 1) {
+                        const stored = allStored[k];
+                        const isLegacyOrCall = stored.origin === "call"
+                            || stored.origin === undefined
+                            || stored.origin === null;
+                        const isCallMember = isLegacyOrCall;
+                        if (!isCallMember && !isCallSysMsg(stored)) continue;
+                        memberIds.add(stored.id);
+                        if (uiRole(stored) !== "system") chatCount += 1;
+                    }
+                    if (memberIds.size > 0) {
+                        ranges.push({
+                            startMsgId: msg.id,
+                            endMsgId: allStored[endIdx].id,
+                            duration,
+                            callType,
+                            interrupted,
+                            chatCount,
+                            memberIds,
+                        });
+                    }
                     i = endIdx + 1;
                     continue;
                 }
             }
             i++;
         }
+
+        // ── 映射回当前窗口 ──────────────────────────────
+        //
+        // 区间按全量记录算，但渲染只能用已加载的消息。三种情形：
+        //   · 起点在窗口内 → 折叠条放在起点处（原有行为）
+        //   · 起点不在窗口内（长通话的常见情形）→ 放到窗口内第一条属于该区间的
+        //     消息上，用户一眼就知道「上面还有一段通话」
+        //   · 终点不在窗口内 → 收在窗口内最后一条属于该区间的消息处
+        const realIdOf = (msg: RenderChatMessage): string => msg.displaySourceId || msg.id;
+        const windowRealIds = projectedMessages.map(realIdOf);
+        type CallGroup = {
+            startId: string;
+            startIdx: number;
+            endIdx: number;
+            duration: string;
+            callType: "voice" | "video";
+            interrupted: boolean;
+            /** 全程对话条数（补偿显示：每一段都要能看出整通电话的规模） */
+            chatCount: number;
+            totalChatCount: number;
+            /** 通话被聊天室消息切断后的段号与总段数 */
+            segmentIndex: number;
+            segmentCount: number;
+            /** 本段在窗口内实际占用的下标 */
+            memberIndices: number[];
+        };
+        const groups: CallGroup[] = [];
+        const memberSet = new Set<number>();
+
+        for (const range of ranges) {
+            const indicesInWindow: number[] = [];
+            for (let k = 0; k < projectedMessages.length; k += 1) {
+                if (range.memberIds.has(windowRealIds[k])) indicesInWindow.push(k);
+            }
+            if (indicesInWindow.length === 0) continue;
+            // 按「连续下标」切段：通话期间在聊天室发的消息不在 memberIds 里，
+            // 会把下标序列从中间断开——断点就是天然的段落边界。
+            const segments: number[][] = [];
+            for (const k of indicesInWindow) {
+                const last = segments[segments.length - 1];
+                if (last && k === last[last.length - 1] + 1) last.push(k);
+                else segments.push([k]);
+            }
+            const exactStart = windowRealIds.indexOf(range.startMsgId);
+            segments.forEach((seg, segIdx) => {
+                for (const k of seg) memberSet.add(k);
+                groups.push({
+                    startId: segIdx === 0 ? range.startMsgId : `seg-${range.startMsgId}-${segIdx}`,
+                    startIdx: seg.includes(exactStart) ? exactStart : seg[0],
+                    endIdx: seg[seg.length - 1],
+                    duration: range.duration,
+                    callType: range.callType,
+                    interrupted: range.interrupted,
+                    chatCount: range.chatCount,
+                    totalChatCount: range.chatCount,
+                    segmentIndex: segIdx + 1,
+                    segmentCount: segments.length,
+                    memberIndices: seg,
+                });
+            });
+        }
+
         return { groups, memberSet };
-    }, [projectedMessages]);
+    }, [projectedMessages, session.id]);
 
     const getSelectableStoredMessageId = useCallback((msg: RenderChatMessage): string | null => {
         const id = msg.displaySourceId || msg.id;
@@ -5740,47 +6031,24 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
         setMessages(nextMessages);
     }, [session.id, stopLoadMoreAnchorTracking]);
 
-    // Shared handler: reload messages + re-trigger scroll-to-bottom after call ends
-    const returnFromCall = (hide: () => void) => {
-        hide();
-        setCallMinimized(false);
-        needsInitialScrollRef.current = true;
-        prevMsgCountRef.current = 0;
-        syncMessagesFromStorage();
-        triggerReply();
-    };
+    // 通话挂断的收尾：通话屏已提升到全局 CallLayer，聊天室不再是它的父级、
+    // 收不到 onEnd 回调。全局层在挂断时广播 chat-call-ended，这里只做界面刷新
+    //（通话留痕已由通话屏落库）；「让角色回应一次」由 desktop-shell 统一触发，
+    // 这样即使挂断时聊天页已经卸载（在桌面/别的 App 里），角色回应也不会丢。
+    useEffect(() => {
+        const handler = (e: Event) => {
+            const detail = (e as CustomEvent<{ sessionId?: string }>).detail;
+            if (detail?.sessionId !== session.id) return;
+            needsInitialScrollRef.current = true;
+            prevMsgCountRef.current = 0;
+            syncMessagesFromStorage();
+        };
+        window.addEventListener("chat-call-ended", handler);
+        return () => window.removeEventListener("chat-call-ended", handler);
+    }, [session.id, syncMessagesFromStorage]);
 
     const editingMessage = editingMessageId ? messages.find(m => m.id === editingMessageId) : null;
     const editingSystemInstruction = editingMessage ? isSystemInstructionMessage(editingMessage) : false;
-
-    // 群聊通话没有缩小悬浮窗，维持原有的整屏早退渲染
-    if (showVoiceCall && session.isGroup && groupCharacters.length > 0) {
-        return (
-            <GroupCallScreen
-                type="voice"
-                session={session}
-                characters={groupCharacters}
-                initiator={callInitiator}
-                initiatorName={callInitiatorName}
-                onEnd={() => returnFromCall(() => setShowVoiceCall(false))}
-            />
-        );
-    }
-
-    if (showVideoCall && session.isGroup && groupCharacters.length > 0) {
-        return (
-            <GroupCallScreen
-                type="video"
-                session={session}
-                characters={groupCharacters}
-                initiator={callInitiator}
-                initiatorName={callInitiatorName}
-                onEnd={() => returnFromCall(() => setShowVideoCall(false))}
-            />
-        );
-    }
-    // 单聊语音/视频通话改为在下方主返回内联渲染（而非提前 return），
-    // 这样缩小为悬浮窗时聊天页与通话组件可以同时挂载，通话状态（计时/字幕）不会丢失。
 
     const chatRoomBackgroundStyle = bgImageResolved ? {
         backgroundColor: "#fff",
@@ -5870,6 +6138,11 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
                         {visibleOfflineTurns.map((turn, turnIdx) => {
                             const offlineDisplay = offlineDisplayByTurnId.get(turn.id) ?? getOfflineDisplayText(turn);
                             const assistantHasHtmlPreview = hasOfflineHtmlPreview(offlineDisplay.assistantContent);
+                            // 整轮回复只有旁白/动作/Sound Tag 时不渲染助手条目——否则会留下
+                            // 一个只有头像和名字、没有台词的空条目。
+                            const assistantOnlyPerformance = !normalizeTextBubbleContent(offlineDisplay.assistantContent)
+                                && !turn.summary.trim()
+                                && !(turn.thinkingText || turn.reasoningText);
                             const prevTime = turnIdx > 0 ? visibleOfflineTurns[turnIdx - 1].createdAt : null;
                             const showTime = !prevTime || shouldShowTimestamp(turn.createdAt, prevTime);
                             return (
@@ -5906,7 +6179,7 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
                                         />
                                     </div>
                                 </div>
-                                <div className="chat-offline-entry" data-role="assistant">
+                                <div className="chat-offline-entry" data-role="assistant" style={assistantOnlyPerformance ? { display: "none" } : undefined}>
                                     {/* 头像占位：默认 display:none（见 chat.css），供自定义 CSS 显示 */}
                                     <div className="chat-offline-avatar" aria-hidden="true">
                                         {effectiveCharacterAvatar ? <img src={effectiveCharacterAvatar} alt="" /> : <ChatFallbackAvatar />}
@@ -6046,8 +6319,15 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
                     const vcGroup = voiceCallGroups.groups.find(g => g.startIdx === idx);
                     if (vcGroup) {
                         const isExpanded = expandedVoiceCallIds.has(vcGroup.startId);
-                        const groupMessages = projectedMessages.slice(vcGroup.startIdx, vcGroup.endIdx + 1);
-                        const chatCount = groupMessages.filter(m => uiRole(m) !== "system").length;
+                        // 展开只渲染这条通话自己的消息（memberIndices）。
+                        // 早先按 [startIdx, endIdx] 整段切片，会把通话期间在聊天室发的
+                        // 消息也塞进通话面板里，看着像「聊天室消息被归为通话记录」（用户实报）。
+                        const groupMessages = vcGroup.memberIndices
+                            .map(i => projectedMessages[i])
+                            .filter(Boolean) as RenderChatMessage[];
+                        // 条数用全量统计（vcGroup.chatCount）：窗口只加载了几十条，
+                        // 按窗口算的话 700 分钟的通话会显示成「12条消息」，严重失真。
+                        const chatCount = vcGroup.chatCount;
                         return (
                             <div key={`vc-${vcGroup.startId}`} className="flex flex-col gap-2">
                                 <div
@@ -6084,7 +6364,19 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
                                             <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" />
                                         </svg>
                                     )}
-                                    <span>{vcGroup.callType === "video" ? "视频通话" : "语音通话"}{vcGroup.duration ? ` ${vcGroup.duration}` : ""}{chatCount > 0 ? ` · ${chatCount}条消息` : ""}</span>
+                                    {/* 补偿显示：通话被聊天室消息切断后会分成多段，但每一段都要能
+                                        看出这通电话的全貌——否则用户从第 2 段开始看，就不知道
+                                        总共打了多久、聊了多少条了。全程总时长与总条数放在每段上，
+                                        段落编号用来表明「这是一通电话的第几段」。 */}
+                                    <span>
+                                        {vcGroup.callType === "video" ? "视频通话" : "语音通话"}
+                                        {vcGroup.duration ? ` · 全程${vcGroup.duration}` : ""}
+                                        {` · 共${vcGroup.totalChatCount}条`}
+                                        {vcGroup.segmentCount > 1 ? ` · 第${vcGroup.segmentIndex}/${vcGroup.segmentCount}段` : ""}
+                                        {/*「无结束记录」只标在最后一段：前面几段后面还有内容，
+                                           标在每段上会让人以为每段都没结束。*/}
+                                        {vcGroup.interrupted && vcGroup.segmentIndex === vcGroup.segmentCount ? " · 无结束记录" : ""}
+                                    </span>
                                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
                                         className="ui-chevron-down-flip" {...(isExpanded ? { "data-open": "" } : {})}>
                                         <polyline points="6 9 12 15 18 9" />
@@ -6703,8 +6995,8 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
 	                onCloseTheaterMode={closeTheaterMode}
 	                onOpenRichModal={(modal) => { setShowPlusMenu(false); setRichModal(modal); }}
                 onOpenCustomPlusAction={handleOpenCustomPlusAction}
-                onStartVideoCall={() => { cancelFollowUp(session.id); setShowPlusMenu(false); setCallInitiator("user"); setShowVideoCall(true); }}
-                onStartVoiceCall={() => { cancelFollowUp(session.id); setShowPlusMenu(false); setCallInitiator("user"); setShowVoiceCall(true); }}
+                onStartVideoCall={() => { cancelFollowUp(session.id); setShowPlusMenu(false); startCall({ sessionId: session.id, characterId: session.isGroup ? "" : session.contactId, kind: "video", initiator: "user" }); }}
+                onStartVoiceCall={() => { cancelFollowUp(session.id); setShowPlusMenu(false); startCall({ sessionId: session.id, characterId: session.isGroup ? "" : session.contactId, kind: "voice", initiator: "user" }); }}
                 onSendText={handleSendText}
                 onStopGeneration={clearStuckGeneration}
                 onTriggerAIResponse={triggerAIResponse}
@@ -7238,35 +7530,8 @@ export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: Chat
                 </div>
             )}
 
-            {/* 单聊语音/视频通话：内联挂载（而非提前 return），使缩小为悬浮窗时通话组件
-                不被卸载，计时/字幕等状态得以保留；组件内部依据 minimized 决定渲染
-                全屏界面还是左侧悬浮窗 */}
-            {/* 通话层挂到聊天室的父容器，脱离 session 自定义 CSS 的作用域。
-                这样用户美化 header/footer、定位和 z-index 时不会遮挡通话顶栏/底栏。 */}
-            {wrapperRef.current?.parentElement && showVoiceCall && character && createPortal(
-                <VoiceCallScreen
-                    session={session}
-                    character={character}
-                    initiator={callInitiator}
-                    minimized={callMinimized}
-                    onMinimize={() => setCallMinimized(true)}
-                    onRestore={() => setCallMinimized(false)}
-                    onEnd={() => returnFromCall(() => setShowVoiceCall(false))}
-                />,
-                wrapperRef.current.parentElement,
-            )}
-            {wrapperRef.current?.parentElement && showVideoCall && character && createPortal(
-                <VideoCallScreen
-                    session={session}
-                    character={character}
-                    initiator={callInitiator}
-                    minimized={callMinimized}
-                    onMinimize={() => setCallMinimized(true)}
-                    onRestore={() => setCallMinimized(false)}
-                    onEnd={() => returnFromCall(() => setShowVideoCall(false))}
-                />,
-                wrapperRef.current.parentElement,
-            )}
+            {/* 通话界面已提升到 desktop-shell 的 CallLayer 常驻渲染：
+                切会话、回桌面、开别的 App 都不再中断通话。聊天室此处不再渲染通话屏。 */}
 
         </div >
     );

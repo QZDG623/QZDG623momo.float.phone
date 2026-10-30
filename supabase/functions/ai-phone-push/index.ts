@@ -574,8 +574,12 @@ Deno.serve(async (request: Request) => {
     }
 
     if (action === "status" && request.method === "GET") {
+      // 个人云服务的是本项目唯一主人，订阅来源却有两处：本网关以 OWNER_ID 写入
+      // 的 Web Push 订阅，以及站点以自身账号 id（单机自部署下是 local_user）
+      // 写入的壳合成订阅（endpoint 以 shell: 开头）。只按 OWNER_ID 过滤会把壳
+      // 订阅判成「不存在」，客户端据此跳过全部离线任务预约——推送从此不再产生。
       const rows = await readJson<Array<{ endpoint: string }>>(await rest(
-        `push_subscriptions?user_id=eq.${OWNER_ID}&select=endpoint&limit=1`,
+        "push_subscriptions?select=endpoint&limit=1",
       ));
       return json({ ok: true, subscribed: rows.length > 0 });
     }
@@ -615,6 +619,20 @@ Deno.serve(async (request: Request) => {
     }
 
     if (action === "jobs") {
+      // 列表：给客户端的「排期管理」面板用。
+      //
+      // 只回 trigger_key / kind / execute_at / status——payload 是加密的，
+      // 网关也没有解密它的能力；而 trigger_key 已足够让前端把每条任务
+      // 反解回「哪个角色、什么用途」（followup:<会话> / idle:<规则> / timedwake:<排期>）。
+      // 这是「删了规则还在发」唯一能查清的地方：服务端可能挂着本地根本
+      // 不知道的任务（idleRepeat 自己续排的 `+` 后缀链）。
+      if (request.method === "GET") {
+        const rows = await readJson<Array<{ trigger_key: string; kind: string; execute_at: string; status: string }>>(await rest(
+          `push_jobs?user_id=eq.${OWNER_ID}&status=in.(pending,running)`
+          + "&select=trigger_key,kind,execute_at,status&order=execute_at.asc&limit=200",
+        ));
+        return json({ ok: true, jobs: rows });
+      }
       const body = await request.json().catch(() => ({})) as Record<string, unknown>;
       const triggerKey = cleanText(body.triggerKey, 200);
       if (request.method === "POST") {
@@ -663,13 +681,38 @@ Deno.serve(async (request: Request) => {
       if (request.method === "DELETE") {
         const triggerPrefix = cleanText(body.triggerPrefix, 200);
         const excludeKey = cleanText(body.excludeKey, 200);
-        if (!triggerKey && !triggerPrefix) return json({ ok: false, error: "缺少预约键。" }, 400);
-        const keyFilter = triggerKey
-          ? `trigger_key=eq.${encodeURIComponent(triggerKey)}`
-          : `trigger_key=like.${encodeURIComponent(`${triggerPrefix}%`)}`
-            + (excludeKey ? `&trigger_key=neq.${encodeURIComponent(excludeKey)}` : "");
+        // all=true：清空本项目名下全部离线预约。
+        //
+        // 必须支持这个参数——客户端「清空存量预约」发的就是 { all: true }
+        //（见 lib/push-bailout-client 的 purgeAllBailoutJobs）。旧实现只认
+        // triggerKey/triggerPrefix，遇到 all 会直接判成「缺少预约键」返回 400，
+        // 用户看到的是「服务端没有确认成功，请检查离线推送是否部署」，
+        // 照着那句提示去查部署和网络，永远查不出所以然。
+        const purgeAll = body.all === true;
+        if (!purgeAll && !triggerKey && !triggerPrefix) {
+          return json({ ok: false, error: "缺少预约键。" }, 400);
+        }
+        const keyFilter = purgeAll
+          ? ""
+          : (triggerKey
+            ? `trigger_key=eq.${encodeURIComponent(triggerKey)}`
+            : `trigger_key=like.${encodeURIComponent(`${triggerPrefix}%`)}`
+              + (excludeKey ? `&trigger_key=neq.${encodeURIComponent(excludeKey)}` : ""));
+        const keyFilterPart = keyFilter ? `&${keyFilter}` : "";
+        // 已领取（running）的任务不能靠删除停手：执行体已经拿到自己那份快照，
+        // 把行删掉并不会中断它，它跑完还会照常续排下一发（见 push-generate 的
+        // idleRepeat）。「规则删了，消息还在发，而且没完没了」正是这么来的。
+        // 必须先标记 cancelled——执行体在生成前与续排前各查一次，被撤就停手。
         await readJson(await rest(
-          `push_jobs?user_id=eq.${OWNER_ID}&status=eq.pending&${keyFilter}`,
+          `push_jobs?user_id=eq.${OWNER_ID}&status=eq.running${keyFilterPart}`,
+          {
+            method: "PATCH",
+            headers: { Prefer: "return=representation" },
+            body: JSON.stringify({ status: "cancelled", updated_at: new Date().toISOString() }),
+          },
+        ));
+        await readJson(await rest(
+          `push_jobs?user_id=eq.${OWNER_ID}&status=eq.pending${keyFilterPart}`,
           { method: "DELETE", headers: { Prefer: "return=representation" } },
         ));
         return json({ ok: true });
@@ -1011,10 +1054,65 @@ $CRON$)`);
       return json({ ok: true, commands: rows.map(toPublicShortcutCommand) });
     }
 
+    if (action === "diagnose" && request.method === "GET") {
+      // 一键自检：把离线推送链路上每个「可能断掉的点」都查一遍，返回结构化结果，
+      // 免去用户逐张表翻看、逐处猜测。只读，不产生任何副作用。
+      const config = await loadConfig();
+      const allSubs = await readJson<Array<{ endpoint: string; user_id: string }>>(await rest(
+        "push_subscriptions?select=endpoint,user_id&limit=50",
+      ));
+      const recentJobs = await readJson<Array<{
+        kind: string;
+        status: string;
+        result_note: string | null;
+        execute_at: string;
+      }>>(await rest(
+        "push_jobs?select=kind,status,result_note,execute_at&order=created_at.desc&limit=20",
+      ));
+      const nowMs = Date.now();
+      const overdue = recentJobs.filter(job => (
+        job.status === "pending" || job.status === "running"
+      ) && Date.parse(job.execute_at) < nowMs - 3 * 60_000);
+
+      const shellSubs = allSubs.filter(sub => sub.endpoint.startsWith("shell:"));
+      const webSubs = allSubs.filter(sub => !sub.endpoint.startsWith("shell:"));
+      // 最近一次真正跑完的任务结果。no_subscription 是最常见的失败信号：
+      // 说明生成阶段就因「查不到订阅」提前退出了，根本没走到广播。
+      const lastDone = recentJobs.find(job => job.status === "done" || job.status === "failed");
+      const noSubHits = recentJobs.filter(job => job.result_note === "no_subscription").length;
+
+      return json({
+        ok: true,
+        config: {
+          hasVapidPublic: Boolean(config.vapid_public_key),
+          hasVapidPrivate: Boolean(config.vapid_private_key),
+          hasPayloadKey: Boolean(config.payload_key),
+          hasCronSecret: Boolean(config.cron_secret),
+          siteOrigin: config.site_origin || null,
+        },
+        subscriptions: {
+          total: allSubs.length,
+          shell: shellSubs.map(sub => ({ endpoint: sub.endpoint, userId: sub.endpoint.slice("shell:".length) })),
+          web: webSubs.length,
+        },
+        jobs: {
+          total: recentJobs.length,
+          pending: recentJobs.filter(job => job.status === "pending").length,
+          overdue: overdue.length,
+          lastResult: lastDone?.result_note ?? null,
+          lastKind: lastDone?.kind ?? null,
+          noSubscriptionCount: noSubHits,
+        },
+      });
+    }
+
     if (action === "test" && request.method === "POST") {
       const config = await loadConfig();
+      // 订阅来源有两处：本网关以 OWNER_ID 写入的 Web Push 订阅，以及站点以自身
+      // 账号 id（单机自部署下是 local_user）写入的壳合成订阅。只按 OWNER_ID 过滤
+      // 会把壳订阅整个漏掉，App 里点「测试」便永远得到「请先开启离线推送」。
       const subscriptions = await readJson<SubscriptionRow[]>(await rest(
-        `push_subscriptions?user_id=eq.${OWNER_ID}&select=endpoint,p256dh,auth`,
+        "push_subscriptions?select=endpoint,p256dh,auth",
       ));
       if (subscriptions.length === 0) return json({ ok: false, error: "请先开启离线推送。" }, 400);
       await new Promise(resolve => setTimeout(resolve, 6000));
@@ -1029,7 +1127,33 @@ $CRON$)`);
       });
       let sent = 0;
       const errors: string[] = [];
-      for (const subscription of subscriptions) {
+      // 壳订阅（endpoint = shell:<站点账号 id>）不走 Web Push，改由 Realtime 广播
+      // 送达壳内长连接——与 push-generate 同一套寻址方式，不掺 user_id。
+      const shellSubs = subscriptions.filter(sub => sub.endpoint.startsWith("shell:"));
+      const webSubs = subscriptions.filter(sub => !sub.endpoint.startsWith("shell:"));
+      for (const subscription of shellSubs) {
+        const shellUserId = subscription.endpoint.slice("shell:".length).trim();
+        if (!shellUserId) continue;
+        try {
+          const response = await fetch(`${supabaseUrl}/realtime/v1/api/broadcast`, {
+            method: "POST",
+            headers: restHeaders,
+            body: JSON.stringify({
+              messages: [{
+                topic: `shellpush:${shellUserId}`,
+                event: "notify",
+                payload: { title: "小手机", body: "个人 Supabase 离线推送已连通。", url: "/" },
+              }],
+            }),
+          });
+          await response.text().catch(() => undefined);
+          if (response.ok) sent += 1;
+          else errors.push(`shell http ${response.status}`);
+        } catch (error) {
+          errors.push(error instanceof Error ? error.message : String(error));
+        }
+      }
+      for (const subscription of webSubs) {
         try {
           const status = await sendWebPushRaw(subscription, payload, {
             publicKey: config.vapid_public_key,

@@ -3,10 +3,13 @@
 import { useEffect } from "react";
 
 import { getRuntimePwaDisplayMode, readPwaDisplayPreference, PWA_DISPLAY_MODE_CHANGED_EVENT } from "@/lib/pwa-display-mode";
+import { isShellEnvironment } from "@/lib/shell-detect";
 
 export function PWAManifestInjector() {
   useEffect(() => {
     const root = document.documentElement;
+    // 壳内始终用应用内状态栏（壳已隐藏系统状态栏），并让两条状态栏滑块真正生效。
+    if (isShellEnvironment()) root.dataset.floatShell = "1";
     const displayModeQueries = ["fullscreen", "standalone", "minimal-ui"].map(mode => (
       window.matchMedia(`(display-mode: ${mode})`)
     ));

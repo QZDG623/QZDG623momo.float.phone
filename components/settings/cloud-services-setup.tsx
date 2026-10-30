@@ -25,6 +25,9 @@ import {
 } from "@/lib/weixin-cloud-sync";
 import { connectPersonalPushCloud, deployPersonalPushCloud, isPersonalPushCloudActive } from "@/lib/personal-push-cloud";
 import { ensurePersonalPushSubscription, getOfflinePushState, markAccountPushSubscribed } from "@/lib/push-client";
+import { diagnoseScheduledBailouts } from "@/lib/push-bailout-diagnostics";
+import { PushSchedulePanel } from "@/components/settings/push-schedule-panel";
+import { formatSelfCheckReport, runOfflinePushSelfCheck } from "@/lib/push-selfcheck";
 import { getWeixinCloudDeployedAt, markWeixinCloudDeployed, savePushCloudScheduled, saveWeixinCloudScheduled } from "@/lib/cloud-deploy-status";
 import { Input, Select } from "@/components/ui/form";
 
@@ -139,6 +142,10 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
     const [organizations, setOrganizations] = useState<OrganizationOption[]>([]);
     const [selectedOrganizationSlug, setSelectedOrganizationSlug] = useState("");
     const [selectedRef, setSelectedRef] = useState("");
+    // 本机当前已连接、但不是「本应用创建」的项目 ref：弹窗里据此提供显式的原地更新入口
+    const [existingRef, setExistingRef] = useState("");
+    // 用户是否主动选择了「更新这个非本应用创建的既有项目」（决定是否显示红字警示）
+    const [updateOverride, setUpdateOverride] = useState(false);
     const [scopeBackup, setScopeBackup] = useState(true);
     const [scopeWeixin, setScopeWeixin] = useState(true);
     const [scopePush, setScopePush] = useState(true);
@@ -150,6 +157,12 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
     const [connectOpen, setConnectOpen] = useState(false);
     const [connectUrl, setConnectUrl] = useState("");
     const [connectKey, setConnectKey] = useState("");
+    // 一键排查：把「哪一段断了」变成可见结论，而不是反复猜。
+    const [checking, setChecking] = useState(false);
+    const [checkText, setCheckText] = useState<string | null>(null);
+    // 清空存量预约：规则删了还在发消息时的唯一解（存量任务散落在多种前缀下，逐条列举必漏）
+    const [purgeOpen, setPurgeOpen] = useState(false);
+    const [purging, setPurging] = useState(false);
 
     useEffect(() => {
         setCloudReady(isCloudBackupConfigured(loadCloudBackupConfig()));
@@ -176,11 +189,17 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
             const managedRef = config.managedProjectRef === configuredRef ? configuredRef : "";
             if (managedRef) {
                 // 本应用创建过的专用项目允许原地重新部署；旧版手填/误选项目没有标记，
-                // 一律走新建流程，绝不把这次发布写回已有业务库。
+                // 默认走新建流程，绝不把这次发布写回已有业务库。
                 setSelectedRef(managedRef);
+                setExistingRef("");
+                setUpdateOverride(false);
                 setOrganizations([]);
                 setSelectedOrganizationSlug(config.managedOrganizationSlug || "");
             } else {
+                // 没有标记但本机确实连着一个项目（多因换设备/清数据丢了标记）：
+                // 不在弹窗里自动选中它，只在用户明确点「更新这个项目」时才原地更新。
+                setExistingRef(configuredRef);
+                setUpdateOverride(false);
                 const data = await callSupabaseAdmin<{ organizations: OrganizationOption[] }>({ action: "organizations", token });
                 if (data.organizations.length === 0) {
                     throw new Error([
@@ -346,6 +365,20 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
         }
     };
 
+    /**
+     * 显式改为「原地更新本机已连接的既有项目」。
+     *
+     * 只由用户在弹窗里主动点击触发：自动判定仍然只认本应用创建过的项目，
+     * 这条路径把「这是我自己要更新的项目」变成一次明确的用户动作，
+     * 服务端 assert_dedicated_project 独立项目校验照旧兜底。
+     */
+    const startUpdateExisting = () => {
+        if (busy || !existingRef) return;
+        setSelectedRef(existingRef);
+        setUpdateOverride(true);
+        setSelectedOrganizationSlug("");
+    };
+
     const openConnectDialog = () => {
         if (busy) return;
         const config = loadCloudBackupConfig();
@@ -423,6 +456,71 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
             setProgress("");
             setBusy(null);
             refreshStatus();
+        }
+    };
+
+    /**
+     * 一键排查：先跑服务端链路自检（配置/账号/订阅/任务表/回传箱/真实广播），
+     * 再跑本机预约诊断（主动消息规则有没有挂上去）。两者合起来覆盖整条链。
+     */
+    const runFullCheck = async () => {
+        if (checking) return;
+        setChecking(true);
+        setResultDialog(null);
+        const sections: string[] = [];
+        try {
+            try {
+                const result = await runOfflinePushSelfCheck(true);
+                sections.push(formatSelfCheckReport(result));
+            } catch (err) {
+                sections.push(`离线推送链路自检失败：${err instanceof Error ? err.message : String(err)}`);
+            }
+            sections.push("");
+            sections.push("─── 本机主动消息预约 ───");
+            try {
+                sections.push(await diagnoseScheduledBailouts());
+            } catch (err) {
+                sections.push(`本机预约诊断失败：${err instanceof Error ? err.message : String(err)}`);
+            }
+            setCheckText(sections.join("\n"));
+        } finally {
+            setChecking(false);
+        }
+    };
+
+    /**
+     * 清空本账号名下全部离线预约。
+     *
+     * 刻意用动态 import：push-bailout-client 本身很大（连着一整条提示词组装链路），
+     * 顶部静态引入会把它拉进首屏加载图、改变模块求值顺序；这条链路只在点按钮时
+     * 需要，按需加载既省首屏又避免影响加载顺序。
+     */
+    const runPurgeAll = async () => {
+        if (purging) return;
+        setPurging(true);
+        try {
+            const { purgeAllBailoutJobs } = await import("@/lib/push-bailout-client");
+            const result = await purgeAllBailoutJobs();
+            setPurgeOpen(false);
+            setResultDialog(result.ok
+                ? {
+                    title: "已清空存量预约",
+                    text: "服务端名下所有待发的离线预约已清除（正在执行的那条也已标记取消）。\n\n如果还有规则在生效，它们会在你下次聊天/切后台时重新挂上新预约——想彻底不再收到，请先去关掉对应规则。",
+                }
+                : {
+                    title: "清空失败",
+                    text: `服务端没有确认成功：${result.error || "未知原因"}。\n\n`
+                        + "如果原因显示「缺少预约键」，说明你的个人云上的离线推送函数还是旧版："
+                        + "到「云服务部署」里重新部署一次离线推送，函数才有「全清」这个能力。",
+                });
+        } catch (err) {
+            setPurgeOpen(false);
+            setResultDialog({
+                title: "清空失败",
+                text: err instanceof Error ? err.message : String(err),
+            });
+        } finally {
+            setPurging(false);
         }
     };
 
@@ -515,6 +613,106 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                 {statusCard(<MessageSquare size={17} strokeWidth={1.9} />, "微信接入", weixinDeployed, "云函数与定时任务已部署")}
                 {statusCard(<Satellite size={17} strokeWidth={1.9} />, "离线推送", pushActive, "已部署到你的 Supabase")}
             </div>
+
+            {/* 排期管理：把服务端的主动消息摊开，按角色看清并逐条删。
+                刻意**不**用 pushActive 门控——原实现只在已部署时渲染，于是没部署的人
+                根本不知道有这个功能，用户报「找不到入口」时也无从判断是「没部署」
+                还是「这版还没上线」。面板自己会说明当前处于哪种状态。 */}
+            <PushSchedulePanel />
+
+            {/* 一键排查：逐段探测断点，输出可直接复制发人的报告 */}
+            <button
+                type="button"
+                className="self-center text-[calc(12px*var(--app-text-scale,1))] font-semibold text-gray-500 underline underline-offset-2 hover:text-gray-700 disabled:opacity-40"
+                onClick={() => void runFullCheck()}
+                disabled={Boolean(busy) || checking}
+            >
+                {checking ? "正在逐段排查…" : "收不到主动消息？一键排查 →"}
+            </button>
+
+            {/* 存量预约清空：删了规则/关了主动联系还在收到消息时用 */}
+            <button
+                type="button"
+                className="self-center text-[calc(12px*var(--app-text-scale,1))] font-semibold text-gray-500 underline underline-offset-2 hover:text-gray-700 disabled:opacity-40"
+                onClick={() => setPurgeOpen(true)}
+                disabled={Boolean(busy) || purging}
+            >
+                {purging ? "正在清空…" : "规则删了还在发消息？清空存量预约 →"}
+            </button>
+
+            {/* 排查报告 */}
+            {checkText !== null && (
+                <div className="modal-overlay" data-ui="modal" onClick={() => setCheckText(null)}>
+                    <div
+                        className="modal-dialog"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label="离线推送排查报告"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="modal-body flex flex-col gap-2">
+                            <h3 className="modal-title">离线推送排查报告</h3>
+                            <pre
+                                className="menu-desc !mt-0 max-h-[52vh] overflow-auto whitespace-pre-wrap rounded-[14px] bg-black/[0.03] px-3 py-2.5"
+                                style={{ wordBreak: "break-word" }}
+                            >{checkText}</pre>
+                        </div>
+                        <div className="modal-footer">
+                            <button
+                                type="button"
+                                className="ui-btn ui-btn-outline"
+                                onClick={() => { void navigator.clipboard?.writeText(checkText).catch(() => undefined); }}
+                            >
+                                复制
+                            </button>
+                            <button type="button" className="ui-btn ui-btn-primary" onClick={() => setCheckText(null)}>
+                                关闭
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* 清空存量预约：二次确认 */}
+            {purgeOpen && (
+                <div className="modal-overlay" data-ui="modal" onClick={() => { if (!purging) setPurgeOpen(false); }}>
+                    <div
+                        className="modal-dialog"
+                        role="alertdialog"
+                        aria-modal="true"
+                        aria-label="清空存量预约"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="modal-body flex flex-col gap-2">
+                            <h3 className="modal-title">清空存量预约？</h3>
+                            <p className="menu-desc !mt-0" style={{ whiteSpace: "pre-line" }}>
+                                会清掉服务端名下<strong>全部待发的离线预约</strong>——包括追问、冷场重连、定时唤醒、经期关怀等所有类型的存量任务。{"\n\n"}
+                                正在执行的那条也会被标记取消，不会再续排下一发。{"\n\n"}
+                                注意：这只是清掉「已经排好的」。如果规则还在生效，下次聊天/切后台时会重新挂上新预约——想彻底不再收到，请先关掉不想保留的规则。{"\n\n"}
+                                确定要清空吗？
+                            </p>
+                        </div>
+                        <div className="modal-footer">
+                            <button
+                                type="button"
+                                className="ui-btn ui-btn-outline"
+                                onClick={() => setPurgeOpen(false)}
+                                disabled={purging}
+                            >
+                                取消
+                            </button>
+                            <button
+                                type="button"
+                                className={`ui-btn ui-btn-primary ${purging ? "is-busy" : ""}`}
+                                onClick={() => void runPurgeAll()}
+                                disabled={purging}
+                            >
+                                {purging ? <><Loader2 size={15} className="animate-spin" /> 清空中…</> : "确认清空"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* 结果弹窗（成功/失败统一） */}
             {resultDialog && (
@@ -616,11 +814,34 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                                 <div className="menu-desc !mt-0 rounded-[14px] bg-black/[0.03] px-3 py-2.5">
                                     将新建独立的「AI Phone Personal Cloud」项目，不会写入任何已有项目。
                                 </div>
+                            ) : updateOverride ? (
+                                <div className="rounded-[14px] bg-amber-500/10 px-3 py-2.5 text-[calc(12px*var(--app-text-scale,1))] font-medium leading-relaxed text-amber-700">
+                                    ⚠️ 将把本次发布<strong>写入你当前已连接的既有项目</strong>
+                                    （{existingRef}.supabase.co）。此项目不是本应用创建的，部署会覆盖其中的
+                                    ai-phone-push / push-generate 等同名云函数。请确认这就是你要更新的项目。
+                                </div>
                             ) : (
                                 <div className="menu-desc !mt-0 rounded-[14px] bg-black/[0.03] px-3 py-2.5">
                                     将更新此前由 AI Phone 创建的专用项目。
                                 </div>
                             )}
+
+                            {!selectedRef && existingRef ? (
+                                <div className="flex flex-col gap-2 rounded-[14px] bg-black/[0.03] px-3 py-2.5">
+                                    <span className="menu-desc !mt-0">
+                                        本机当前连着一个项目（{existingRef}.supabase.co），但没有「本应用创建」标记
+                                        （换设备、清数据或旧版手填地址都会这样）。要更新它就选这里，否则将新建项目。
+                                    </span>
+                                    <button
+                                        type="button"
+                                        className="ui-btn ui-btn-outline self-start"
+                                        onClick={startUpdateExisting}
+                                        disabled={Boolean(busy)}
+                                    >
+                                        更新这个已有项目
+                                    </button>
+                                </div>
+                            ) : null}
                             {!selectedRef && (
                                 <label className="flex flex-col gap-1">
                                     <span className="menu-desc !mt-0">创建到哪个 Supabase 组织</span>
@@ -655,7 +876,7 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                             >
                                 {busy === "deploy"
                                     ? <><Loader2 size={15} className="animate-spin" /> {progress || "部署中…"}</>
-                                    : selectedRef ? "开始部署" : "创建并部署"}
+                                    : updateOverride ? "更新此项目" : selectedRef ? "开始部署" : "创建并部署"}
                             </button>
                         </div>
                     </div>

@@ -2,10 +2,12 @@ export type Character = {
   id: string;
   name: string;
   avatar: string | null; // data URL 或外部 URL
-  /** 聊天 APP 专用头像；不会修改角色卡，也不会影响剧情等其他 APP。 */
-  chatAvatar?: string | null;
-  /** 是否在聊天 APP 中启用专用头像；关闭后恢复跟随角色卡头像。 */
-  chatAvatarEnabled?: boolean;
+  /** 视频通话大画面形象（IndexedDB 资产 ID）；空则用 avatar */
+  callImage?: string;
+  /** 角色说话时叠加的「张嘴」差分图 */
+  callImageTalk?: string;
+  /** 角色眨眼时叠加的「闭眼」差分图 */
+  callImageBlink?: string;
   persona: string;       // 人设
   briefPersona?: string; // 简量版人设：注入到同世界有关系角色的「角色关系」marker，供对方了解 TA（防 OOC）
   briefPersonaUpdatedAt?: string; // 简介生成时间；早于 updatedAt 时编辑器提示「设定已更新，建议重新生成」

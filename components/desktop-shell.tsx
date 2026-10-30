@@ -32,6 +32,7 @@ import ReadingApp from "@/components/reading/reading-app";
 import MapApp from "@/components/map/map-app";
 import { DwellingApp } from "@/components/dwelling/dwelling-app";
 import { MascotFloat } from "@/components/mascot/mascot-float";
+import { PerceptionBootstrap } from "@/components/perception/perception-bootstrap";
 import { MascotPreviewHost } from "@/components/mascot/mascot-preview-host";
 import { useMusicControlsOptional } from "@/lib/music-context";
 import { PhoneResourcesApp, type ResourceSubPage } from "@/components/phone-resources-app";
@@ -135,6 +136,7 @@ import { parseAIResponse } from "@/lib/rich-message-parser";
 import { requestBackgroundChatReply, scheduleFollowUp } from "@/lib/follow-up-service";
 import { CHAT_MESSAGE_NOTICE_EVENT, CHAT_OPEN_SESSION_EVENT, type ChatMessageNoticeDetail } from "@/lib/chat-notification-events";
 import { startIncomingCallVibration } from "@/lib/call-vibration";
+import { CallLayer } from "@/components/chat/call-layer";
 import { installChatSoundListener, playChatSoundOnce, setMiniChatSoundSessionId, startChatSoundLoop } from "@/lib/chat-sound";
 import { setMascotContext } from "@/lib/mascot-context";
 import { DESKTOP_WIDGETS_CHANGED_EVENT } from "@/lib/mascot-events";
@@ -142,6 +144,7 @@ import { useWeixinBridge } from "@/lib/use-weixin-bridge";
 import { startWeixinCloudRealtimeSync } from "@/lib/weixin-cloud-sync";
 import { WeixinSyncToast } from "@/components/weixin-sync-toast";
 import { sendBrowserNotification } from "@/lib/browser-notification";
+import { canSendShellNotification, sendShellNotification } from "@/lib/shell-notify";
 import type { ChatSharePayload } from "@/lib/chat-share";
 import { completePendingMcpOAuthCallback } from "@/lib/tool-executor";
 import { LayoutGrid, LoaderCircle, RefreshCw } from "lucide-react";
@@ -909,6 +912,16 @@ function measureTextareaCaretRect(textarea: HTMLTextAreaElement): KeyboardTarget
 }
 
 function getKeyboardTargetRect(element: HTMLElement): KeyboardTargetRect {
+  // 聊天输入栏 / 多选栏是“上输入框、下发送按钮”的竖向结构。
+  // 抬高的目标必须是整条栏子的 bottom（含发送按钮），而不是文字光标那一行，
+  // 否则只把输入框顶部抬到键盘上方、发送按钮仍被键盘盖住。
+  const inputBar = element.closest<HTMLElement>("[data-ui='input'], [data-ui='multi-select']");
+  if (inputBar) {
+    const rect = inputBar.getBoundingClientRect();
+    return { top: rect.top, bottom: rect.bottom };
+  }
+
+  // 其它独立输入框（设置项、文件夹重命名等）没有底部按钮，仍按原逻辑抬光标。
   if (element instanceof HTMLTextAreaElement) {
     return measureTextareaCaretRect(element);
   }
@@ -955,6 +968,14 @@ function useAndroidCaretKeyboardLift() {
         return;
       }
 
+      // interactive-widget=resizes-content 生效时（布局视口被键盘原生压缩、innerHeight 变小），
+      // 键盘避让已由原生布局完成；此时再叠加手动 lift 会把输入栏顶离键盘，
+      // 在输入栏和键盘之间产生一条空白。检测到原生压缩标记时彻底关闭手动抬升。
+      if (document.documentElement.dataset.nativeKbResize === "1") {
+        applyLift(0);
+        return;
+      }
+
       const keyboardTop = viewport.offsetTop + viewport.height;
       const keyboardInset = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
       const targetRect = getKeyboardTargetRect(element);
@@ -977,14 +998,18 @@ function useAndroidCaretKeyboardLift() {
 
     const handleFocusIn = (event: FocusEvent) => {
       const target = event.target;
-      if (!isKeyboardEditableElement(target)) return;
+      if (!isKeyboardEditableElement(target)) {
+        return;
+      }
       focusedElement = target;
       requestUpdate();
     };
 
     const handleFocusOut = () => {
       focusedElement = null;
-      applyLift(0);
+      // 失焦统一走 requestUpdate()：由 update() 依据当前状态清掉 lift（移除 --mobile-keyboard-lift）。
+      // 抬升已改用 margin-top（真实布局位移）实现，hit-test 始终与视觉同步，不再需要同步 applyLift(0)。
+      requestUpdate();
     };
 
     const handleCaretMove = () => {
@@ -1013,6 +1038,79 @@ function useAndroidCaretKeyboardLift() {
       viewport?.removeEventListener("resize", handleViewportChange);
       viewport?.removeEventListener("scroll", handleViewportChange);
       root.style.removeProperty("--mobile-keyboard-lift");
+    };
+  }, []);
+}
+
+/**
+ * Android 原生键盘适配（配合 app/layout.tsx 的 viewport interactive-widget=resizes-content）。
+ * 键盘弹出时浏览器会原生压缩布局视口（window.innerHeight 变小），这里把
+ * --phone-screen-height 实时同步为 (innerHeight + status-bar-drop)，使虚拟手机
+ * 整体压缩、输入栏天然贴在键盘上方——无需手动抬升，点击命中区域由原生布局保证。
+ * 旧版浏览器不支持 interactive-widget 时 innerHeight 不变，本 hook 等于空操作，
+ * 自动回退到 useAndroidCaretKeyboardLift 的手动抬升方案，两套机制不会叠加。
+ */
+function useAndroidNativeKeyboardViewport() {
+  useEffect(() => {
+    if (!/Android/i.test(navigator.userAgent)) {
+      return;
+    }
+    const mobileMq = window.matchMedia("(max-width: 500px) and (hover: none) and (pointer: coarse)");
+    if (!mobileMq.matches) {
+      return;
+    }
+
+    const root = document.documentElement;
+    let raf = 0;
+    let maxInnerHeight = window.innerHeight;
+
+    const apply = () => {
+      raf = 0;
+      if (!mobileMq.matches) {
+        return;
+      }
+      // innerHeight 明显小于历史最大值 = 键盘已让浏览器原生压缩布局视口。
+      // 打上标记，供 useAndroidCaretKeyboardLift 关闭手动抬升，避免双重补偿产生中间空白。
+      maxInnerHeight = Math.max(maxInnerHeight, window.innerHeight);
+      if (window.innerHeight < maxInnerHeight - 80) {
+        root.dataset.nativeKbResize = "1";
+      } else {
+        delete root.dataset.nativeKbResize;
+      }
+      // 手机壳有 -status-bar-drop 的负 margin-top，高度补上这段才能让底栏贴住视口底/键盘顶
+      const wrap = document.querySelector<HTMLElement>(".phone-shell-wrap");
+      const drop = wrap ? (parseFloat(getComputedStyle(wrap).getPropertyValue("--status-bar-drop")) || 0) : 0;
+      root.style.setProperty("--phone-screen-height", `${Math.round(window.innerHeight + drop)}px`);
+    };
+
+    const requestApply = () => {
+      if (raf) window.cancelAnimationFrame(raf);
+      raf = window.requestAnimationFrame(apply);
+    };
+
+    const handleOrientationChange = () => {
+      // 旋转屏幕时 innerHeight 基线会整体变化，重置后再按新方向判断
+      maxInnerHeight = window.innerHeight;
+      requestApply();
+    };
+
+    apply();
+    window.addEventListener("resize", requestApply);
+    window.addEventListener("orientationchange", handleOrientationChange);
+    // 用户在设置里调整状态栏上移量（写入 wrap 的 --status-bar-drop）时也要重算
+    const observer = new MutationObserver(requestApply);
+    const wrap = document.querySelector<HTMLElement>(".phone-shell-wrap");
+    if (wrap) {
+      observer.observe(wrap, { attributes: true, attributeFilter: ["style"] });
+    }
+
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf);
+      window.removeEventListener("resize", requestApply);
+      window.removeEventListener("orientationchange", handleOrientationChange);
+      observer.disconnect();
+      delete root.dataset.nativeKbResize;
+      root.style.removeProperty("--phone-screen-height");
     };
   }, []);
 }
@@ -1048,6 +1146,7 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     musicOverlayControllerRef.current = controller;
   }, []);
   useAndroidCaretKeyboardLift();
+  useAndroidNativeKeyboardViewport();
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
   const [layout, setLayout] = useState<DesktopLayout>(DEFAULT_LAYOUT);
   // Dock is an ordered icon-id list (max DOCK_MAX), kept disjoint from `layout`.
@@ -2464,6 +2563,42 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
     }, 0);
   }, []);
 
+  // 离线推送通知点击 → 壳把 App 拉起并写入 #open-chat=<sessionId> 深链。
+  // 冷启动时 hash 首帧就在，但要等聊天数据水合完（desktopReady）再开，
+  // 否则找不到会话会静默放弃；App 已在运行时壳只改 hash，走 hashchange 热启动。
+  useEffect(() => {
+    if (!desktopReady) return;
+    const consumeOpenChatHash = () => {
+      const match = window.location.hash.match(/open-chat=([^&]+)/);
+      if (!match) return;
+      const url = new URL(window.location.href);
+      // 只清 hash，保留 query（可能有来电的 ring 参数在同一路径上）
+      window.history.replaceState(null, "", url.pathname + url.search);
+      const sessionId = decodeURIComponent(match[1]);
+      if (sessionId) openChatSessionFromNotice(sessionId);
+    };
+    const bootTimer = window.setTimeout(consumeOpenChatHash, 1200);
+    window.addEventListener("hashchange", consumeOpenChatHash);
+    return () => {
+      window.clearTimeout(bootTimer);
+      window.removeEventListener("hashchange", consumeOpenChatHash);
+    };
+  }, [desktopReady, openChatSessionFromNotice]);
+
+  // 通话挂断后让角色回应一次。
+  // 通话屏已提升到全局层，挂断时聊天页可能根本没挂载（用户在桌面/别的 App 里），
+  // 所以收尾放在常驻的桌面壳里；requestBackgroundChatReply 自身会处理
+  //「聊天页正开着时由聊天页生成」的情况，不会重复两套内容。
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const sessionId = (e as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (!sessionId) return;
+      window.setTimeout(() => { void requestBackgroundChatReply(sessionId); }, 0);
+    };
+    window.addEventListener("chat-call-ended", handler);
+    return () => window.removeEventListener("chat-call-ended", handler);
+  }, []);
+
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<{
@@ -2564,6 +2699,15 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       const title = detailSenderName && detailSenderName !== "对方"
         ? detailSenderName
         : (isGroup ? session.groupName || "群聊" : session.alias || char?.name || "新消息");
+
+      // 壳环境：站内横幅整体停用，改发原生系统通知（标题/头像沿用上面的解析结果）。
+      // 放在这里是因为「正在看这个会话就不打扰」的判断刚做完——用户要的正是
+      // 「除当前聊天页外全线弹系统通知」，过滤逻辑与横幅共用同一处。
+      if (canSendShellNotification()) {
+        // 第 4 个参数带会话 id：壳点通知时据此直达该会话；旧壳会忽略多余参数。
+        sendShellNotification(title, detail.body.trim(), detail.avatar ?? char?.avatar ?? null, detail.sessionId);
+        return;
+      }
 
       if (chatMessageNoticeTimerRef.current !== null) {
         window.clearTimeout(chatMessageNoticeTimerRef.current);
@@ -4059,7 +4203,32 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       return <PhoneCalendarApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
     }
     if (activeApp === "realitybridge") {
-      return <RealityBridgeApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
+      return (
+        <RealityBridgeApp
+          onClose={() => setActiveApp(null)}
+          onNotice={setNotice}
+          onOpenSettings={(page) => {
+            // 跳到设置里的某个子页。这里必须**两条腿一起跑**，只靠一条会漏：
+            //
+            //  ① sessionStorage 标记 —— 只有设置页处于「重新挂载」状态时才会被
+            //     读到。它是给「设置页此刻没开着」这种正常情况用的。
+            //  ② settings-navigate 事件 —— 设置页常驻监听，**不依赖挂载时机**。
+            //
+            // 之前只用了 ①，于是出现「跳转了但停在设置主菜单」：设置页的读取
+            // effect 只在挂载时跑一次，实例若被复用、或那次读取没赶上，标记就白写了。
+            // ②补上后，无论设置页是刚挂载还是早就在，这一页都切得过去。
+            //
+            // 顺序要紧：先关掉当前 App，再开设置——否则设置页会被现实桥盖住。
+            try { sessionStorage.setItem("mascot-settings-mode", page); } catch { /* 隐私模式等，忽略 */ }
+            setActiveApp("settings");
+            // 等设置页挂载完成再把事件送过去。180ms 足够它渲染并装上监听器；
+            // 早于此事件没人接，晚了用户已经看到主菜单、会有「闪一下才跳」的观感。
+            window.setTimeout(() => {
+              window.dispatchEvent(new CustomEvent("settings-navigate", { detail: { page } }));
+            }, 180);
+          }}
+        />
+      );
     }
     if (activeApp === "qa") {
       return (
@@ -4841,6 +5010,9 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
               {/* 预览弹窗宿主：独立于桌宠的展开/收起状态，否则桌宠收成小球时弹不出来 */}
               <MascotPreviewHost />
 
+              {/* 全局通话层：常驻桌面壳，切会话 / 回桌面 / 开别的 App 都不中断通话 */}
+              <CallLayer />
+
               {/* Widget Picker Bottom Sheet */}
               {showWidgetPicker && (
                 <div className="widget-picker-sheet" onClick={e => e.stopPropagation()}>
@@ -5058,6 +5230,8 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
           </div>
         </div>
       </section>
+      {/* 感知引擎：挂载即开始采样，卸载即停止。非壳环境自动空转 */}
+      <PerceptionBootstrap />
       {/* 微信云同步过程可视化：拉取/上传/运行包同步与失败都在这里冒 toast */}
       <WeixinSyncToast />
     </>

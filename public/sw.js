@@ -1,4 +1,35 @@
-const CACHE_VERSION = "ai-phone-pwa-v12";
+// v13：本次升版是为了强制作废旧缓存。
+// 折叠逻辑的修复已进 main，但客户端仍在跑旧 JS —— /_next/static/ 走 cache-first，
+// 旧包会被一直留在 RUNTIME_CACHE 里。升 CACHE_VERSION 会在 activate 时整批清空。
+// v14：同上，为语音朗读清洗（只念台词、不再把 CSS/旁白当台词念）清一次旧缓存。
+// v15：显示层清洗——灰色旁白气泡与 (breath) 标签不再进聊天正文；同样需要强制作废旧 JS。
+// v16：线下模式渲染路径也接入清洗（它不走 MessageBubble，以前会漏），并处理转义成
+//      `&lt;span&gt;` 的旁白 HTML；语音条时长按真实台词重算。再清一次旧缓存。
+// v17：v16 那次 Netlify 构建失败、线上一直停在 v15，设备侧仍跑着旧 JS。
+//      本次连同 APK 1.0.16 一起重发，再次清空旧缓存，确保灰色旁白与
+//      (breath) 清洗真正生效。
+// v18：线上实际停留在 commit 6b4ab91 的旧构建（t2a_v2 请求里仍带 (breath)，
+//      于是模型把 breath 念成英文）。本次把 Sound Tag 全换成 <#x#> 停顿、
+//      中文台词里的英文一律抹掉，连同 APK 1.0.17 重发，再清一次旧 JS。
+// v19：v18 的 <#x#> 停顿标记在用户 MiniMax 账号上被忽略，breath 仍被念成英文。
+//      本次彻底放弃括号 Sound Tag 和 <#x#>，所有括号整块删掉、官方标签换成
+//      中文标点（breath→逗号、sighs→省略号），连同 APK 1.0.20 重发。
+// 注意：这么大范围的清空会让字体/模型重新下载一轮，是刻意为之——只在
+// 修复客户端"跑旧 JS"时才升版，日常改动不要动这个数字。
+// v20：收回「中文台词里的英文一律抹掉」，只删括号内容；台词正文里的英文照常念。
+// v22：v20 只跑到「网页 PWA」层，Vercel 生产构建仍停在 cab86e2（那边英文照旧被抹掉）。
+//      本次清一次缓存，让设备重新拉取只删括号的新 JS。
+// v23：新增 MiniMax 语音识别支持 + 通话免提连续语音输入，清缓存让设备拉取新 JS。
+// v24：修复免提录音听不到声音（AudioContext 被挂起 → 电平恒 0 → VAD 不触发），
+//      并修复自动搭话面板被拖出屏幕/高度溢出导致改不了参数。
+// v25：麦克风申请改回 audio:true 并带自动重试；AI 说话期间只静音不再反复释放麦克风。
+// v26：WebView 音频采集在部分机型直接 NotReadableError，免提语音改走壳的原生
+//      AudioRecord（window.FloatMic），网页侧只轮询电平 + 取 WAV 段送识别。
+// v27：新增 Fish Audio 语音服务商（TTS + 音色同步 + 识别）。
+// v28：识别方案可与合成方案分开；Fish 识别额度不足时报可操作的中文提示。
+// v29：视频通话支持自定义角色形象（闭嘴/张嘴/闭眼差分图），说话张嘴 + 随机眨眼。
+// v30：张嘴节奏放慢到正常语速，且只在真正播放语音时才切换。
+const CACHE_VERSION = "ai-phone-pwa-v31";
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 

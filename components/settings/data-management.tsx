@@ -289,6 +289,8 @@ export function DataManagement({ onNotice }: DataManagementProps) {
   const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
   const [pendingExport, setPendingExport] = useState<PendingExport | null>(null);
   const [exportSaving, setExportSaving] = useState(false);
+  /** 下载到「下载」目录的实时进度 {loaded, total}，null 表示尚未开始或非分块路径。 */
+  const [exportProgress, setExportProgress] = useState<{ loaded: number; total: number } | null>(null);
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [restartNotice, setRestartNotice] = useState<RestartNotice | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -484,15 +486,20 @@ export function DataManagement({ onNotice }: DataManagementProps) {
   const savePendingExport = async () => {
     if (!pendingExport || exportSaving) return;
     setExportSaving(true);
+    setExportProgress(null);
     try {
       const useNativeShare = isIOSBrowser();
-      await downloadBackupBlob(pendingExport.blob, pendingExport.manifest, useNativeShare ? { nativeShareOnly: true } : { disableNativeShare: true });
+      await downloadBackupBlob(pendingExport.blob, pendingExport.manifest, {
+        ...(useNativeShare ? { nativeShareOnly: true } : { disableNativeShare: true }),
+        onProgress: (loaded, total) => setExportProgress({ loaded, total }),
+      });
       setPendingExport(null);
-      onNotice?.(useNativeShare ? "已打开系统分享，请选择“存储到文件”。" : "已开始下载备份文件。");
+      onNotice?.(useNativeShare ? "已打开系统分享，请选择“存储到文件”。" : "备份已保存到「下载」目录。");
     } catch (error) {
       onNotice?.(error instanceof Error ? error.message : "无法打开系统分享，请稍后再试。");
     } finally {
       setExportSaving(false);
+      setExportProgress(null);
     }
   };
 
@@ -1059,6 +1066,24 @@ export function DataManagement({ onNotice }: DataManagementProps) {
                   ? "iOS 需要从系统分享面板保存备份文件。请点击下方按钮，然后选择“存储到文件”。"
                   : "备份文件已准备好。请点击下方按钮下载文件。"}
               </p>
+              {exportSaving && exportProgress && (
+                <div style={{ marginTop: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                    <span className="menu-desc">正在写入下载目录…</span>
+                    <span className="menu-desc">
+                      {Math.round((exportProgress.loaded / exportProgress.total) * 100)}% · {formatBytes(exportProgress.loaded)} / {formatBytes(exportProgress.total)}
+                    </span>
+                  </div>
+                  <div style={{ width: "100%", height: 8, background: "var(--ui-bg-muted, #eee)", borderRadius: 4, overflow: "hidden" }}>
+                    <div style={{
+                      width: `${(exportProgress.loaded / exportProgress.total) * 100}%`,
+                      height: "100%",
+                      background: "var(--ui-accent, #4f7cff)",
+                      transition: "width 0.2s ease",
+                    }} />
+                  </div>
+                </div>
+              )}
             </div>
             <div className="modal-footer" data-ui="modal-footer" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               <button type="button" className="ui-btn ui-btn-primary" style={{ width: "100%", whiteSpace: "nowrap" }} onClick={() => void savePendingExport()} disabled={exportSaving}>

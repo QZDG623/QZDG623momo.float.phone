@@ -1,7 +1,8 @@
 // lib/chat-engine.ts
 
 import { createSseJsonParser } from "./sse-json";
-import { maybeAppendShortcutCapability } from "./offline-shortcut-capability";
+import { maybeAppendShortcutCapability, maybeAppendPerceptionStatus } from "./offline-shortcut-capability";
+import { maybeBuildStatusInjection } from "./perception/describe";
 import { loadCharacters } from "./character-storage";
 import { buildScreenEffectPromptHint } from "./chat-screen-effects";
 import { emitChatPluginEvent, runChatPluginTransform } from "./chat-plugin-hooks";
@@ -366,6 +367,9 @@ type ChatPromptBuildOptions = {
     activateAllWorldBooks?: boolean;
     toolsAllowed?: boolean;
     forceEnableTools?: boolean;
+    /** 只随本次请求送出的系统提示：不落库、不进历史、下一轮读不到。
+     *  定时查岗这类「一次性事件」用它告诉角色此刻该怎么回应。 */
+    ephemeralSystemNote?: string;
 };
 
 function matchesPromptProfileRef(prompt: { identifier: string; name?: string }, refs: Set<string>): boolean {
@@ -2024,22 +2028,31 @@ export async function buildChatPromptMessages(
     }
     if (!session.isGroup && !isOfflineMode && resolvedAppId === "chat") {
         const meetingInviteConfig = resolveMeetingInviteCardConfig(loadChatAppSettings());
-        llmMessages.push({
-            role: "system",
-            content: [
-                meetingInviteConfig.contract.trim() || "你可以根据当前对话语境，自主决定是否邀请用户线下见面。不要机械邀请，也不要频繁使用。",
-                "只有当你确实想见面时，才把契约要求的字段完整输出，并用 [邀请见面] 与 [/邀请见面] 包住整个字段区块。",
-                "字段内容会被界面按用户自定义 HTML 渲染成邀请卡片；包裹标签和字段不会显示成普通聊天文字。不要解释标签，每轮最多输出一张邀请卡片。",
-            ].join("\n"),
-        });
-        llmMessages.push({
-            role: "system",
-            content: [
-                `私聊备注信息：用户给你的备注是“${session.alias?.trim() || character.name}”；你给用户的备注是“${session.characterRemarkForUser?.trim() || "尚未设置"}”。`,
+        // ── 邀请见面卡片提示词 ──
+        // enabled=true → 每轮注入；enabled=false → 完全不注入
+        if (meetingInviteConfig.enabled) {
+            llmMessages.push({
+                role: "system",
+                content: [
+                    meetingInviteConfig.contract.trim() || "你可以根据当前对话语境，自主决定是否邀请用户线下见面。不要机械邀请，也不要频繁使用。",
+                    "只有当你确实想见面时，才把契约要求的字段完整输出，并用 [邀请见面] 与 [/邀请见面] 包住整个字段区块。",
+                    "字段内容会被界面按用户自定义 HTML 渲染成邀请卡片；包裹标签和字段不会显示成普通聊天文字。不要解释标签，每轮最多输出一张邀请卡片。",
+                ].join("\n"),
+            });
+        }
+
+        // ── 私聊备注提示词 ──
+        // remarkEnabled=true → 每轮注入；remarkEnabled=false → 完全不注入
+        if (meetingInviteConfig.remarkEnabled) {
+            llmMessages.push({
+                role: "system",
+                content: [
+                    `私聊备注信息：用户给你的备注是“${session.alias?.trim() || character.name}”；你给用户的备注是“${session.characterRemarkForUser?.trim() || "尚未设置"}”。`,
                 "用户询问备注时，请按当前信息自然回答。用户要求你更改你给TA的备注时，请结合人设与最近聊天决定新备注，并在自然回复末尾另起一行输出控制标记：[给用户备注:新备注]。",
                 "新备注不超过20个字；控制标记不会展示给用户。不要用这个标记改动用户给你的备注。",
-            ].join("\n"),
-        });
+                ].join("\n"),
+            });
+        }
     }
     if (avatarChangeIntent) {
         llmMessages.push({
@@ -2065,6 +2078,24 @@ export async function buildChatPromptMessages(
         });
     }
     appendEmptyGenerateGuardMessage(llmMessages, config, historyForPrompt);
+
+    // ── 感知状态注入（默认关）──
+    // 放在所有系统消息之后、历史之前：让它是「最后一眼背景」，
+    // 又不打断预设精心安排的消息顺序。只在线聊天注入——离线场景由
+    // offline-shortcut-capability 的 maybeAppendPerceptionStatus 负责。
+    if (!isOfflineMode) {
+        const perceptionInjection = maybeBuildStatusInjection();
+        if (perceptionInjection) llmMessages.push({ role: "system", content: perceptionInjection });
+    }
+
+    // ── 一次性事件提示（定时查岗的反应指导语）──
+    // 放在最后：它是「此刻该怎么回应」的即时要求，压过前面所有常驻设定。
+    // 只存在于本次请求的 messages 数组里，没人把它写进聊天记录，所以不会
+    // 在后续每一轮被重新读到、变成反复念叨。
+    const ephemeralSystemNote = options?.ephemeralSystemNote?.trim();
+    if (ephemeralSystemNote) {
+        llmMessages.push({ role: "system", content: ephemeralSystemNote });
+    }
 
     return { llmMessages, character, config, preset, regexes, userIdentity, toolsEnabled };
 }
@@ -2660,6 +2691,10 @@ async function generateChatCompletionCore(
         const bailoutMessages = [...llmMessages];
         // 这条路径不挂续跑（见上），所以也不能向角色承诺第二轮
         maybeAppendShortcutCapability(bailoutMessages, { continuationAvailable: false });
+        // 感知状态：同样只在这条（云端接管的）兜底路径注入——本地能生成时
+        // 走不到这里，由 buildChatPromptMessages 负责。注入的是本地渲染好的
+        // 一行文字，随提示词一起上传，云端不需要理解感知系统的内部结构。
+        maybeAppendPerceptionStatus(bailoutMessages);
         void import("./push-bailout-client").then(async mod => {
             const handle = await mod.armReplyBailout({
                 sessionId: session.id,

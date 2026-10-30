@@ -492,6 +492,24 @@ Deno.serve(async (req: Request) => {
     body: JSON.stringify({ status, result_note: note.slice(0, 300), updated_at: new Date().toISOString() }),
   }).catch(() => undefined);
 
+  /**
+   * 这一单是否已被客户端撤销。
+   *
+   * 用户关掉/删掉主动消息时，站点接口会把该规则相关的任务改成 cancelled（pending
+   * 的直接删除）。但本函数往往已经把它领取成 running 并在跑 LLM——那时它自己这份
+   * 快照不受影响。不查一次的话，规则删了它照样生成、照样弹通知，还会继续续排下一发，
+   * 用户看到的就是「根本没关上」。
+   * 查不到（网络抖动等）按「未被撤销」处理，宁可多发一次也不误杀正常消息。
+   */
+  const isCancelled = async (): Promise<boolean> => {
+    const response = await rest(
+      `push_jobs?id=eq.${encodeURIComponent(job.id)}&select=status&limit=1`,
+    ).catch(() => null);
+    if (!response || !response.ok) return false;
+    const rows = await response.json().catch(() => []) as { status?: string }[];
+    return rows[0]?.status === "cancelled";
+  };
+
   // 分段进度：卡死时 result_note 会停在最后完成的一步，精确定位死点
   const startedAt = Date.now();
   const progress = (note: string) => rest(`push_jobs?id=eq.${encodeURIComponent(job.id)}`, {
@@ -576,7 +594,13 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    const subsResponse = await rest(`push_subscriptions?user_id=eq.${encodeURIComponent(job.user_id)}&select=endpoint,p256dh,auth`);
+    // 订阅有两个来源、两套 user_id：壳合成订阅由站点以自身账号 id 注册
+    // （单机自部署下是 local_user），而任务一律挂在 OWNER_ID(owner) 下。
+    // 按 job.user_id 过滤会把壳订阅整个漏掉，于是生成阶段就误判「没有订阅」
+    // 直接放弃（result_note 记 no_subscription），用户永远等不到主动消息——
+    // 连 LLM 都不会被调用。个人云只服务本项目唯一的主人，这里取全部订阅；
+    // 是否为壳订阅由 endpoint 前缀在投递阶段分流（见下方 webSubs / shellTopics）。
+    const subsResponse = await rest("push_subscriptions?select=endpoint,p256dh,auth");
     const subs = subsResponse.ok ? await subsResponse.json() as SubscriptionRow[] : [];
     if (subs.length === 0 && payload.weixin?.force !== true) {
       await finish("done", "no_subscription");
@@ -592,6 +616,13 @@ Deno.serve(async (req: Request) => {
     const todayRows = capResponse.ok ? await capResponse.json() as unknown[] : [];
     if (todayRows.length >= DAILY_GENERATION_CAP) {
       await finish("done", `daily cap (${DAILY_GENERATION_CAP}) reached`);
+      return;
+    }
+
+    // 动模型之前先确认这一单还没被用户撤销——生成一次要烧 token，
+    // 撤了就不该再花这个成本，也不该再弹一条用户已经不要的通知。
+    if (await isCancelled()) {
+      await finish("done", "cancelled before generate");
       return;
     }
 
@@ -1079,7 +1110,19 @@ Deno.serve(async (req: Request) => {
     // 安卓壳（FloatShell App）的合成订阅（endpoint 以 shell: 开头）不走 Web Push，
     // 改由 Supabase Realtime 广播送达壳内长连接。
     const webSubs = subs.filter(sub => !sub.endpoint.startsWith("shell:"));
-    const hasShellSub = webSubs.length < subs.length;
+    // 壳订阅由站点按站点账号 id 注册（单机自部署下是 local_user），而个人云的任务
+    // 一律挂在 OWNER_ID(owner) 下——按 job.user_id 过滤永远取不到壳那行，
+    // hasShellSub 恒为 false，下面的广播整段被跳过：消息生成成功、写得进 outbox，
+    // 却永远弹不出通知。壳订阅本就只属于本项目唯一的主人，按 endpoint 前缀单独取，
+    // 不掺 user_id；topic 也改用 endpoint 里带的站点 id，与壳实际订阅的频道一致。
+    const shellSubsResponse = await rest("push_subscriptions?endpoint=like.shell:*&select=endpoint&limit=50");
+    const shellTopics = (shellSubsResponse.ok
+      ? await shellSubsResponse.json() as { endpoint: string }[]
+      : [])
+      .map(sub => String(sub.endpoint || "").slice("shell:".length).trim())
+      .filter(Boolean)
+      .map(userId => `shellpush:${userId}`);
+    const hasShellSub = shellTopics.length > 0;
     const vapid = vapidRow
       ? { publicKey: vapidRow.vapid_public_key, privateKey: vapidRow.vapid_private_key, subject: siteOrigin || "mailto:push@ai-phone.local" }
       : null;
@@ -1097,7 +1140,11 @@ Deno.serve(async (req: Request) => {
 
     for (let index = 0; index < parts.length; index += 1) {
       if (index > 0) await sleep(500);
-      const partBody = parts[index].slice(0, 80);
+      // 单条截断从 80 放宽到 200：分条规则与聊天记录同口径（都按双空行拆），
+      // 一一对应才是「同步」；真正让两处看起来不一致的是截断——过去稍长的消息
+      // 在通知里只剩开头一句，聊天里却是完整的。正常聊天单条远不到 200 字，
+      // 几乎不会触发截断。
+      const partBody = parts[index].slice(0, 200);
       const message = JSON.stringify({
         type: deliverAsCall ? "incoming_call" : "chat_outbox",
         title: deliverAsCall ? `📞 ${title}` : title,
@@ -1128,17 +1175,23 @@ Deno.serve(async (req: Request) => {
             method: "POST",
             headers: restHeaders,
             body: JSON.stringify({
-              messages: [{
-                topic: `shellpush:${job.user_id}`,
+              messages: shellTopics.map(topic => ({
+                topic,
                 event: "notify",
                 payload: {
                   title: deliverAsCall ? `📞 ${title}` : title,
                   body: partBody,
                   url: targetUrl,
-                  // 老壳不认识这些字段 → 照常显示普通通知，自然向下兼容
-                  ...(deliverAsCall ? { kind: "call", characterName: title, sessionId: callSessionId, callTs: Date.now() } : {}),
+                  // 老壳不认识这些字段 → 照常显示普通通知，自然向下兼容。
+                  // sessionId 让壳点击通知直达对应会话（普通消息原先没有，点开只回桌面）；
+                  // avatar 是角色头像（data URL 或直链），有就当通知大图标，没有壳用默认图。
+                  ...(callSessionId ? { sessionId: callSessionId } : {}),
+                  ...(typeof payload.notify?.avatar === "string" && payload.notify.avatar
+                    ? { avatar: payload.notify.avatar }
+                    : {}),
+                  ...(deliverAsCall ? { kind: "call", characterName: title, callTs: Date.now() } : {}),
                 },
-              }],
+              })),
             }),
           });
           await response.text().catch(() => undefined);
@@ -1158,6 +1211,11 @@ Deno.serve(async (req: Request) => {
     await writeShortcutDeliveryDiagnostic();
 
     // 冷场重连的下一发：连发上限内自动排队（用户回来后客户端会撤销并按新周期重挂）
+    // 用户已撤销这条链时绝不再续排——否则规则删了，新单还会源源不断地冒出来。
+    if (await isCancelled()) {
+      await finish("done", `generated, pushed ${pushed}, cancelled before repeat`);
+      return;
+    }
     const idleRepeat = payload.merge?.idleRepeat as
       | { intervalMs?: number; remaining?: number; quietWin?: { startMin: number; endMin: number; tzOffsetMin: number } | null }
       | undefined;
@@ -1185,18 +1243,40 @@ Deno.serve(async (req: Request) => {
           : undefined,
       };
       const nextPayload = { ...payload, merge: nextMerge };
+      const nextTriggerKey = `${job.trigger_key}+`;
       await rest("push_jobs", {
         method: "POST",
         body: JSON.stringify([{
           id: `job_${crypto.randomUUID()}`,
           user_id: job.user_id,
-          trigger_key: `${job.trigger_key}+`,
+          trigger_key: nextTriggerKey,
           kind: "timed_task",
           execute_at: new Date(nextFire + 15_000).toISOString(),
           status: "pending",
           payload: await encryptPayload(JSON.stringify(nextPayload), payloadKey),
         }]),
       }).catch(() => undefined);
+      // 同规则去重（服务端兜底）：冷场重连的下一发既可能由这里续排，也可能由
+      // 客户端重挂（切后台/回前台都会重新挂单）。两边并行时旧链不会消失——
+      // 曾出现同一条「长时间没消息」规则 2 分半内跑出 6 单（:0 / :0+ / :0++ /
+      // :1 / :1+ / :2），用户被连弹好几条通知。客户端虽有延迟清理，但依赖
+      // 页面还活着，App 被杀或长时间后台时根本不执行。
+      // 这里以规则为界清掉其它还挂着的 pending，只留刚挂上的这一单。
+      // 仅在本链还会继续（nextMerge.idleRepeat 仍在）时清理：若是最后一发，
+      // 服务端链到此结束，此时再删客户端的单会让这条规则彻底没有后续。
+      // trigger_key 形如 idle:<ruleId>:<n>，ruleId 内不含冒号，取最后一个冒号及之前即前缀。
+      if (nextMerge.idleRepeat && job.trigger_key.startsWith("idle:")) {
+        const rulePrefix = job.trigger_key.slice(0, job.trigger_key.lastIndexOf(":") + 1);
+        if (rulePrefix.length > "idle:".length) {
+          await rest(
+            `push_jobs?user_id=eq.${encodeURIComponent(job.user_id)}`
+            + `&trigger_key=like.${encodeURIComponent(`${rulePrefix}%`)}`
+            + `&trigger_key=neq.${encodeURIComponent(nextTriggerKey)}`
+            + "&status=eq.pending",
+            { method: "DELETE" },
+          ).catch(() => undefined);
+        }
+      }
     }
 
     await finish("done", `generated, pushed ${pushed}${shortcutActionNote ? `, ${shortcutActionNote}` : ""}${pushErrors.length ? `, errors: ${pushErrors.slice(0, 3).join(" | ")}` : ""}`);

@@ -5106,6 +5106,33 @@
   background-position: center;
   filter: blur(20px) brightness(0.4);
 }
+
+/* 角色差分图动效：说话张嘴 / 随机眨眼（纯 CSS，避免高频 React 重渲染） */
+.videocall-frame-talk {
+  opacity: 0;
+  pointer-events: none;
+  animation: videocall-talk 1s steps(1, end) infinite;
+}
+/* 接近正常说话：约每秒 3 次开合，且开合时长不规则，避免机械节拍 */
+@keyframes videocall-talk {
+  0%, 12% { opacity: 0; }
+  13%, 34% { opacity: 0.85; }
+  35%, 41% { opacity: 0; }
+  42%, 64% { opacity: 0.85; }
+  65%, 70% { opacity: 0; }
+  71%, 86% { opacity: 0.85; }
+  87%, 100% { opacity: 0; }
+}
+.videocall-frame-blink {
+  opacity: 0;
+  pointer-events: none;
+  animation: videocall-blink 4.5s linear infinite;
+}
+@keyframes videocall-blink {
+  0%, 92% { opacity: 0; }
+  93%, 97% { opacity: 0.85; }
+  98%, 100% { opacity: 0; }
+}
 .videocall-self-cam {
   position: absolute;
   right: 16px;

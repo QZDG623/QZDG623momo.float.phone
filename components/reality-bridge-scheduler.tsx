@@ -4,7 +4,7 @@ import { useEffect } from "react";
 
 import { bgSetTimeout } from "@/lib/bg-timer";
 import { hydrateKvDb } from "@/lib/kv-db";
-import { processBridgeItem } from "@/lib/reality-bridge/engine";
+import { processBridgeItem, runDueDelayedTasks, runDueScheduledRules } from "@/lib/reality-bridge/engine";
 import { bridgeConnection, loadBridgeSettings, pullBridgeInbox } from "@/lib/reality-bridge/storage";
 
 export const REALITY_BRIDGE_FEED_UPDATED_EVENT = "reality-bridge-feed-updated";
@@ -17,18 +17,34 @@ async function pollOnce(force = false): Promise<number> {
   try {
     await hydrateKvDb();
     const settings = loadBridgeSettings();
-    /* force = 用户手动点刷新，是明确意图，不受自动接收开关限制 */
-    if (!settings.enabled && !force) return 0;
     const { config, ready } = bridgeConnection();
-    if (!ready) return 0;
-    const items = await pullBridgeInbox(config);
-    for (const item of items) {
-      await processBridgeItem(item);
+
+    // ── 先跑纯本地的那两类：定时联动、延迟补执行 ──
+    //
+    // **必须在任何开关判断之前**。它们不经过云端、不需要 iPhone，
+    // 只依赖「小手机开着」这一件事。原来的写法把 settings.enabled 的判断
+    // 放在了最前面（settings.enabled 是「接收快捷指令消息」开关），
+    // 于是那个开关一关，连「每天早上说句早安」这种纯本地的定时规则
+    // 都不会被检查——到点不触发、历史里也没有任何记录（实测反馈）。
+    // 注释当时写着「与云端无关」，但代码没做到，这里补上。
+    const localFired = (await runDueScheduledRules()) + (await runDueDelayedTasks());
+
+    // ── 再处理需要云端的那条路 ──
+    // force = 用户手动点刷新，是明确意图，不受自动接收开关限制。
+    let pulled = 0;
+    if (ready && (settings.enabled || force)) {
+      const items = await pullBridgeInbox(config);
+      for (const item of items) {
+        await processBridgeItem(item);
+      }
+      pulled = items.length;
     }
-    if (items.length > 0 && typeof window !== "undefined") {
+
+    // 任一有动静就通知界面刷新（历史页/概览都要跟着变）
+    if ((pulled > 0 || localFired > 0) && typeof window !== "undefined") {
       window.dispatchEvent(new CustomEvent(REALITY_BRIDGE_FEED_UPDATED_EVENT));
     }
-    return items.length;
+    return pulled;
   } catch (err) {
     console.warn("[现实桥] 轮询失败", err);
     return 0;

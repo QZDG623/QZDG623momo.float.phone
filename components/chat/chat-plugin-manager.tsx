@@ -108,11 +108,21 @@ export function ChatPluginManager({ onBack }: { onBack: () => void }) {
     };
 
     const handleFileChosen = async (file: File | undefined) => {
+        // 先清空 input：否则同一个文件再选一次不会触发 change
+        if (fileInputRef.current) fileInputRef.current.value = "";
         if (!file) return;
+        // 文件名校验：选择框已不再用 accept 过滤（原因见输入框处的注释），
+        // 这里补一道，免得选到 zip/txt 后只看到一句难懂的「插件脚本执行失败」。
+        const lowerName = file.name.toLowerCase();
+        if (!lowerName.endsWith(".js") && !lowerName.endsWith(".mjs")) {
+            const text = `只能选择 .js / .mjs 插件文件（当前选的是 ${file.name}）`;
+            if (fileTargetRef.current === "import") setHint({ ok: false, text });
+            else setUpdateHint({ id: fileTargetRef.current, ok: false, text });
+            return;
+        }
         const text = await file.text();
         if (fileTargetRef.current === "import") await handleInstall(text);
         else await handleUpdate(fileTargetRef.current, text);
-        if (fileInputRef.current) fileInputRef.current.value = "";
     };
 
     /** 就地更新：同 id 覆盖安装（配置与数据保留），并校验源码 id 与本插件一致 */
@@ -316,7 +326,18 @@ export function ChatPluginManager({ onBack }: { onBack: () => void }) {
                                 <span className="menu-desc" style={{ color: hint.ok ? "var(--c-success)" : "var(--c-danger)" }}>{hint.text}</span>
                             </div>
                         )}
-                        <input ref={fileInputRef} type="file" accept=".js,.mjs,text/javascript" className="hidden" onChange={e => { void handleFileChosen(e.target.files?.[0]); }} />
+                        {/* 这里刻意不写 accept=".js,.mjs,text/javascript"：
+                            安卓壳的 WebView 会把 accept 翻成系统级 MIME 过滤，而 .js / text/javascript
+                            在安卓文件管理器里没有可靠的 MIME 映射，结果是所有文件都变灰、根本选不中。
+                            改成通配的 accept 放行（见下方 input 的 accept 属性），
+                            选完再由 handleFileChosen 校验扩展名。 */}
+                        <input
+                            ref={fileInputRef}
+                            type="file"
+                            accept="*/*"
+                            className="hidden"
+                            onChange={e => { void handleFileChosen(e.target.files?.[0]); }}
+                        />
                     </div>
                 </div>
 

@@ -57,6 +57,87 @@ export function isInvisibleOrWhitespaceOnly(text: string): boolean {
     return INVISIBLE_OR_WHITESPACE_ONLY_RE.test(text);
 }
 
+// 表演指令的外壳：HTML 标签（style 属性里常带整串 CSS）、方括号/中文括号/圆括号/
+// 花括号/书名号块。按语音世界书，括号内内容都是"怎么演"而不是"说什么"。
+const PERFORMANCE_SHELL_RE = /<[^>]*>|\[[^\]]*\]|【[^】]*】|（[^）]*）|\([^)]*\)|\{[^}]*\}|《[^》]*》|〈[^〉]*〉/g;
+const DANGLING_BRACKET_RE = /[\[\]【】（）(){}《》〈〉<>]/g;
+
+/**
+ * 模型/同步链路偶尔把旁白 HTML 转义成 `&lt;span style=…&gt;`，渲染出来就是一整段
+ * 灰字乱码，而按标签正则匹配时又看不到 `<`。判空与剥壳前先还原成真标签。
+ * `&amp;` 必须最后还原，否则 `&amp;lt;` 会被当成标签。
+ */
+function decodeDisplayEntities(text: string): string {
+    return text
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&quot;/gi, '"')
+        .replace(/&#0*39;|&apos;/gi, "'")
+        .replace(/&amp;/gi, "&");
+}
+
+/**
+ * 内容是否"整条都不是台词"——只剩旁白/动作/音效指令。
+ *
+ * 把 HTML 与各类括号块剥掉之后若再无任何可见字符，说明这条消息只是角色的
+ * 神态、动作或 Sound Tag（例如 `[月薪喵擦汗<span style="…">（秀腹肌）</span>]`、
+ * `(sighs)`）。这类消息既不是台词，也不该被念出来，显示层整条隐藏。
+ * 只要还有一句真话（哪怕旁边挂着 (breath)），就不算。
+ */
+export function isNonDialogueOnlyContent(text: string): boolean {
+    if (!text) return false;
+    const rest = decodeDisplayEntities(text)
+        .replace(PERFORMANCE_SHELL_RE, " ")
+        .replace(DANGLING_BRACKET_RE, " ");
+    return isInvisibleOrWhitespaceOnly(rest);
+}
+
+// ── 显示层清洗：把"怎么演"的标记从聊天正文里拿掉 ──────────
+// 语音世界书的第一条铁律是"括号内一律是表演指令，不是台词"。模型经常把它演成
+// 一条灰色旁白（`[月薪喵擦汗<span style="…">（秀腹肌）</span>]`），过去这段 HTML
+// 连同 style 属性里的整串 CSS 一起被当作正文渲染，聊天里就是一坨灰色乱码。
+// 这里在渲染前统一剥掉，只留真正说出口的话。
+//
+// 要躲开的三类东西（它们不是旁白）：```html 代码块、<style>/<script> 段落、
+// markdown 链接与图片——先摘成占位符，剥完再放回来。
+const DISPLAY_PROTECTED_RE = /```[\s\S]*?```|<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|!?\[[^\]\n]*\]\([^)\n]*\)/gi;
+// 方括号里带 HTML 标签的旁白块：连方括号一起删（模型幻觉的灰色动作条）
+const HTML_BEARING_BRACKET_RE = /\[[^\]]*<[^\]]*\]/g;
+// MiniMax 官方 Sound Tag：(breath)/(sighs)… 交给模型演绎成换气/笑意，本身不是台词
+const PERFORMANCE_SOUND_TAG_RE = /\((?:laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasp|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)/gi;
+// 方括号/中文方括号/花括号/中文括号块：世界书规定括号内一律是表演指令。
+// 英文圆括号保留——它常包着真正的译文而不是旁白，只单独清理已知 Sound Tag。
+const BRACKET_BLOCK_RE = /\[[^\]\n]*\]|【[^】\n]*】|\{[^}\n]*\}|〈[^〉\n]*〉|（[^）\n]*）/g;
+
+/** 剥掉表演指令外壳，返回"只该被看到"的正文。空串表示这条消息没有台词。 */
+export function stripPerformanceShells(text: string): string {
+    if (!text) return "";
+    // 转义过的旁白 HTML（`&lt;span style=…&gt;`）先还原，否则 `<` 看不到、整段灰字都会留下来
+    const decoded = decodeDisplayEntities(text);
+    // 完整的自定义 HTML 卡片（<script> + <style>）是渲染用的，整段原样保留
+    if (/<script\b[\s\S]*?<\/script>/i.test(decoded) && /<style\b[\s\S]*?<\/style>/i.test(decoded)) return text;
+
+    const kept: string[] = [];
+    const stash = (value: string) => `\u0001${kept.push(value) - 1}\u0001`;
+
+    let out = decoded
+        .replace(DISPLAY_PROTECTED_RE, stash)
+        .replace(HTML_BEARING_BRACKET_RE, " ")
+        // 其余 HTML 标签：含 <#0.3#> 停顿标记，也含 style 属性里的整串 CSS 英文
+        .replace(/<[^>]*>/g, " ")
+        .replace(PERFORMANCE_SOUND_TAG_RE, " ")
+        .replace(BRACKET_BLOCK_RE, " ")
+        .replace(/[\[\]【】（）{}《》〈〉<>]/g, " ");
+
+    out = out.replace(/\u0001(\d+)\u0001/g, (_, index: string) => kept[Number(index)] ?? "");
+    return out
+        .replace(/[^\S\n]+/g, " ")
+        .replace(/ ?\n ?/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+}
+
 const C = "\\s*[：:]\\s*"; // half-width or full-width colon, allowing surrounding spaces
 
 function parseMuteMinutes(num?: string, unit?: string): number {
@@ -774,7 +855,9 @@ export function parseAIResponse(rawText: string, previousState: StateValue[]): P
     //    part empty → filtered out → inner monologue lands on the first real reply.
     const cleaned = parts.map(p => {
         if (p.mediaType) return p;
-        const display = stripTextToolDirectives(restore(p.content));
+        // 先还原受保护的 HTML 块，再剥表演外壳：灰色旁白（HTML 包着的动作）在这里被
+        // 整块拿掉，纯旁白段直接变空 → 被下面的 filter 丢弃，连气泡都不会生成。
+        const display = stripTextToolDirectives(stripPerformanceShells(restore(p.content)));
         return { ...p, content: display };
     }).filter(p => p.mediaType || !isInvisibleOrWhitespaceOnly(p.content));
 

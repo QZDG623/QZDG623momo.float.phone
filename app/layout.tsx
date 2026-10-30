@@ -15,6 +15,10 @@ export const viewport: Viewport = {
   maximumScale: 1,
   userScalable: false,
   viewportFit: "cover",
+  // Android 键盘弹出时让浏览器原生压缩布局视口（而非只压缩 visualViewport）。
+  // 配合 desktop-shell 的 --phone-screen-height 同步：输入栏天然贴在键盘上方，
+  // 点击命中区域由原生布局保证，彻底避免手动抬升带来的视觉/hit-test 错位。
+  interactiveWidget: "resizes-content",
 };
 
 export const metadata: Metadata = {

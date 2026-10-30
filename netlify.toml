@@ -73,6 +73,15 @@
   [headers.values]
     Cache-Control = "public, max-age=31536000, immutable"
 
+# Service Worker 文件本身绝不能缓存：浏览器只在「拿到新的 sw.js」时才会触发
+# install/activate。若 sw.js 被 CDN 或浏览器缓存住，页面会一直跑旧 SW、
+# 拿不到新构建（本次通话折叠修复就卡在这里：/main@fa42d13 已含修复，
+# 客户端却仍在跑旧 JS）。
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
 # 根目录散图（吉祥物小卷、默认壁纸）——同样改文件名才更新。
 [[headers]]
   for = "/mascot.png"

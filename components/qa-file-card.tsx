@@ -4,6 +4,7 @@
 // 内容按需从角色电脑 Worker 拉取（不占本地存储），支持预览（文本/图片）与保存。
 
 import { useState } from "react";
+import { createPortal } from "react-dom";
 import { Download, Eye, FileText, Loader2 } from "lucide-react";
 import { agentComputerRequest } from "@/lib/agent-computer";
 import { downloadFile } from "@/lib/download-utils";
@@ -114,7 +115,7 @@ export function QaFileCard({ file }: { file: QaFileCardInfo }) {
             )}
             {error && <div className="qa-file-card-error">{error}</div>}
 
-            {preview && (
+            {preview && createPortal(
                 <div className="modal-overlay" data-ui="modal" onClick={() => setPreview(null)}>
                     <div className="modal-dialog" data-ui="modal-dialog" style={{ maxHeight: "76vh", display: "flex", flexDirection: "column" }}
                         onClick={event => event.stopPropagation()}>
@@ -148,7 +149,8 @@ export function QaFileCard({ file }: { file: QaFileCardInfo }) {
                             <button className="ui-btn ui-btn-primary" onClick={() => void save()}>保存</button>
                         </div>
                     </div>
-                </div>
+                </div>,
+                document.body,
             )}
         </div>
     );

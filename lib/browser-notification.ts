@@ -1,7 +1,14 @@
 // lib/browser-notification.ts
 // Browser Notification API wrapper for background alerts.
+//
+// 壳（FloatShell）环境不走这里：Android WebView 没有 Notification/PushManager，
+// 系统通知统一由「消息提醒事件」转发给原生桥（见 lib/shell-notify.ts 与
+// desktop-shell 对 CHAT_MESSAGE_NOTICE_EVENT 的处理）。本文件只管浏览器。
 
 import { loadChatAppSettings } from "./chat-storage";
+// 直接引 shell-detect（无依赖的独立模块）：push-client 反向 import 本文件，
+// 从这里 import push-client 会形成循环依赖。
+import { isShellEnvironment } from "./shell-detect";
 
 let _notifCounter = 0;
 
@@ -67,6 +74,10 @@ export function sendBrowserNotification(
     title: string,
     options?: { body?: string; icon?: string },
 ): void {
+    // 壳环境直接返回：系统通知统一由原生桥发（见 lib/shell-notify.ts）。
+    // 这里必须显式挡住——Android WebView 里 Notification 与 Service Worker 都可能
+    // 存在，万一权限被判定为 granted，同一条消息就会被「原生桥 + SW」弹两次。
+    if (isShellEnvironment()) return;
     if (!isNotificationEnabled()) return;
     if (!document.hidden) return;
 

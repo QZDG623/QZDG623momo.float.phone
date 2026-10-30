@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useLayoutEffect, useCallback, useRef, createContext, type CSSProperties, type ReactNode } from "react";
-import { Activity, Check, ChevronRight, Clock, Database, FileText, Fingerprint, Globe, HardDrive, Image, Info, KeyRound, Laptop, Layers, Link2, Loader2, LogOut, MessageSquare, Mic, SlidersHorizontal, UserCircle, Wrench, X, CloudUpload } from "lucide-react";
+import { Activity, CalendarDays, Camera, Check, ChevronRight, Clock, Database, FileText, Fingerprint, Globe, HardDrive, Image, Info, KeyRound, Laptop, Layers, LayoutTemplate, Link2, Loader2, LogOut, MessageSquare, Mic, PhoneCall, SlidersHorizontal, UserCircle, Wrench, X, CloudUpload, Zap } from "lucide-react";
 import { ConfirmDialog } from "./ui/modal";
 import { useAccount } from "@/lib/account-context";
 import { isSelfHostedModeEnabled } from "@/lib/self-hosting";
@@ -21,6 +21,12 @@ import { CloudServicesPage } from "./settings/cloud-services-setup";
 import { ToolboxSettings } from "./settings/toolbox-settings";
 import { ModerationCenter } from "./settings/moderation-center";
 import { AgentComputerSettings } from "./settings/agent-computer-settings";
+import { CallOverlaySettings } from "./settings/call-overlay-settings";
+import { PerceptionSettings } from "./perception/perception-settings";
+import { DeviceActionSettings } from "./device-action/device-action-settings";
+import { SystemCalendarSettings } from "./system-calendar/system-calendar-settings";
+import { ScreenshotSettings } from "./screenshot/screenshot-settings";
+import { WidgetSettings } from "./widget/widget-settings";
 import { fetchIsAdmin } from "@/lib/moderation-client";
 import { PageShell } from "./ui/page-shell";
 import { CardGrid, FeaturedCard, type CardItem, type FeaturedCardItem } from "./ui/card-grid";
@@ -57,6 +63,12 @@ type SubPage =
     | "toolbox"
     | "agentComputer"
     | "moderation"
+    | "callOverlay"
+    | "perception"
+    | "deviceAction"
+    | "systemCalendar"
+    | "screenshot"
+    | "widget"
     | "about";
 
 const SETTINGS_MENU = [
@@ -71,6 +83,12 @@ const SETTINGS_MENU = [
     { id: "cloud", icon: CloudUpload, label: "云服务部署", desc: "备份 / 微信 / 推送一站配置", iconColor: BINDING_ACCENTS.api , glass: "" },
     { id: "weixin", icon: MessageSquare, label: "微信接入", desc: "iLink Bot", iconColor: CONTENT_APP_ACCENTS.chat , glass: "weixin" },
     { id: "toolbox", icon: Wrench, label: "聊天工具箱", desc: "外部工具调用", iconColor: BINDING_ACCENTS.voice , glass: "toolbox" },
+    { id: "callOverlay", icon: PhoneCall, label: "通话浮窗外观", desc: "回复条配色", iconColor: BINDING_ACCENTS.voice , glass: "voice" },
+    { id: "perception", icon: Activity, label: "感知", desc: "让角色知道电量、网络与在用应用", iconColor: BINDING_ACCENTS.memory , glass: "" },
+    { id: "deviceAction", icon: Zap, label: "操作设备", desc: "让角色帮你开灯、调音量、打开应用", iconColor: BINDING_ACCENTS.voice , glass: "" },
+    { id: "systemCalendar", icon: CalendarDays, label: "系统日历", desc: "让角色知道你的日程、记下纪念日", iconColor: BINDING_ACCENTS.memory , glass: "" },
+    { id: "screenshot", icon: Camera, label: "截屏", desc: "让角色看一眼你现在的屏幕", iconColor: BINDING_ACCENTS.voice , glass: "" },
+    { id: "widget", icon: LayoutTemplate, label: "桌面小组件", desc: "角色留在桌面上的话", iconColor: BINDING_ACCENTS.memory , glass: "" },
     { id: "agentComputer", icon: Laptop, label: "角色电脑", desc: "云端小电脑（自部署）", iconColor: BINDING_ACCENTS.memory , glass: "agent-computer" },
     { id: "identity", icon: UserCircle, label: "用户身份", desc: "个人信息", iconColor: BINDING_ACCENTS.identity , glass: "identity" },
     { id: "about", icon: Info, label: "关于与声明", desc: "版本与协议", iconColor: BINDING_ACCENTS.memory , glass: "about" },
@@ -320,6 +338,18 @@ export function PhoneSettingsApp({ onClose, onNotice }: SettingsPageProps) {
                 return <WeixinSettings onOpenCloudServices={() => setCurrentPage("cloud")} />;
             case "toolbox":
                 return <ToolboxSettings />;
+            case "callOverlay":
+                return <CallOverlaySettings onNotice={onNotice} />;
+            case "perception":
+                return <PerceptionSettings onNotice={onNotice} />;
+            case "deviceAction":
+                return <DeviceActionSettings onNotice={onNotice} />;
+            case "systemCalendar":
+                return <SystemCalendarSettings onNotice={onNotice} />;
+            case "screenshot":
+                return <ScreenshotSettings onNotice={onNotice} />;
+            case "widget":
+                return <WidgetSettings onNotice={onNotice} />;
             case "agentComputer":
                 return <AgentComputerSettings onNotice={onNotice} />;
             case "moderation":
@@ -333,9 +363,65 @@ export function PhoneSettingsApp({ onClose, onNotice }: SettingsPageProps) {
         }
     };
 
+    /**
+     * 滚动位置记忆。
+     *
+     * 原来的实现是「每次切页都滚到顶」——从列表点进某个卡片、看完返回，
+     * 列表又回到最上面，想接着看下一个得重新往下翻。设置页的卡片多
+     * （尤其 Connections 那一屏），这个体验很伤。
+     *
+     * 现在的规则：
+     *   · 在主菜单里滚动时随时记下位置；
+     *   · 回到主菜单时恢复它；
+     *   · 进入任何子页本身仍然从顶部开始（那是新内容，从头看才对）。
+     *
+     * 只记「主菜单」这一处的滚动位置，不给每个子页各存一份——
+     * 用户抱怨的正是「点开卡片退回列表跳顶」，子页之间的来回很少见，
+     * 存多了反而会出现「莫名停在半路」的困惑。
+     */
+    const mainScrollRef = useRef(0);
+
     useLayoutEffect(() => {
-        pageBodyRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+        const body = pageBodyRef.current;
+        if (!body) return;
+        if (currentPage === "main") {
+            // 回到主菜单：恢复到离开时的位置
+            body.scrollTo({ top: mainScrollRef.current, left: 0, behavior: "auto" });
+            return;
+        }
+        // 进子页：新内容，从头看
+        body.scrollTo({ top: 0, left: 0, behavior: "auto" });
     }, [currentPage]);
+
+    // 当前页的镜像。scroll 事件是异步派发的，可能在切页之后才送到——
+    // handler 用它判断「这一刻还在不在主菜单」，避免把子页那份已被浏览器
+    // 夹过的 scrollTop 写回记录，把好不容易记下的位置覆盖掉。
+    const currentPageRef = useRef<SubPage>(currentPage);
+    useLayoutEffect(() => { currentPageRef.current = currentPage; }, [currentPage]);
+
+    /**
+     * 记录主菜单滚动位置：在主菜单停留期间用 scroll 事件持续记录。
+     *
+     * 为什么不在「离开那一刻」读一次：那一提交里 page-body 的子节点已经换成
+     * 子页内容，若子页首帧比主菜单矮，浏览器会就地把 scrollTop 夹到新上限，
+     * 读到的已不是用户原来的位置。夹掉多少取决于子页高度与滚动深度，于是
+     * 出现「同是返回，有的页面正常、有的跳顶」。滚动时记录没有这个时序依赖。
+     */
+    useEffect(() => {
+        const body = pageBodyRef.current;
+        if (!body || currentPage !== "main") return;
+        const onScroll = () => {
+            if (currentPageRef.current !== "main") return;
+            mainScrollRef.current = body.scrollTop;
+        };
+        body.addEventListener("scroll", onScroll, { passive: true });
+        // 返回主菜单、恢复位置之后同步一次，让记录对齐真实值
+        onScroll();
+        return () => body.removeEventListener("scroll", onScroll);
+    }, [currentPage]);
+
+    // 各条进子页的入口（卡片、FeaturedCard、事件跳转）都不必自己记一笔，
+    // 也就不会漏掉某个入口——位置由上面的 scroll 监听持续记录。
 
     // Check for pending mascot navigation mode on mount (stored by desktop-shell)
     useEffect(() => {
@@ -369,11 +455,23 @@ export function PhoneSettingsApp({ onClose, onNotice }: SettingsPageProps) {
         return () => window.removeEventListener("mascot-navigate-mode", onMode);
     }, []);
 
-    // Listen for internal settings tab navigation (e.g. mascot "修改绑定" button)
+    /**
+     * 内部深链：别处（现实桥、桌宠等）要求跳到设置里的某一子页。
+     *
+     * 这条通道与上面那条 sessionStorage 标记是**互补**关系，不是重复：
+     * 标记只在设置页「刚挂载」时读得到一次，而事件监听是常驻的——
+     * 设置页早已挂载、或那次读取没赶上时，靠这条才切得过去。
+     *
+     * 必须校验 page 合法性：写错一个 id 就会落进 renderSubPage 的
+     * default 分支，用户看到一张空白页，比不跳还糟。
+     */
     useEffect(() => {
         const onNav = (e: Event) => {
             const { page } = (e as CustomEvent).detail ?? {};
-            if (page) setCurrentPage(page as SubPage);
+            if (typeof page !== "string") return;
+            if (!SETTINGS_MENU.some(m => m.id === page)) return;
+            setCurrentPage(page as SubPage);
+            setSubpageTitle(null);
         };
         window.addEventListener("settings-navigate", onNav);
         return () => window.removeEventListener("settings-navigate", onNav);
@@ -421,7 +519,7 @@ export function PhoneSettingsApp({ onClose, onNotice }: SettingsPageProps) {
                             </div>
                             <div className="mt-[10px]">
                                 <CardGrid
-                                    items={SETTINGS_MENU.filter(item => ["weixin", "toolbox"].includes(item.id)).map(makeCardItem)}
+                                    items={SETTINGS_MENU.filter(item => ["weixin", "toolbox", "callOverlay", "perception", "deviceAction", "systemCalendar", "screenshot", "widget"].includes(item.id)).map(makeCardItem)}
                                 />
                             </div>
                             <div className="mt-[10px]">

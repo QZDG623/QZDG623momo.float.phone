@@ -39,6 +39,16 @@ export type BridgeRuleActions = {
   outbox?: { type: string };
   /** 广播 bridge.data 事件给已订阅的自定义 APP */
   broadcast?: boolean;
+  /** 在本机上真的做一件事（手电筒、音量、打开应用……）。
+   *  与「快捷动作」的区别：这条不经过云端、不用 iPhone 参与，直接在安卓壳里执行；
+   *  args 里的字符串值支持 {payload}/{type} 占位；执行受「设置 → 操作设备」
+   *  里的逐动作开关约束，没开的动作会被拒绝并如实记进流水。 */
+  deviceAction?: { action: string; args?: Record<string, unknown> };
+  /** 调用任意一个已启用的工具/动作：内置能力、工具箱里的 REST 与组合工具、MCP 工具、
+   *  自定义 APP 工具都能在这里被规则直接调用。
+   *  args 里的字符串值支持 {payload}/{type} 占位；characterId 可选，决定
+   *  「写入记忆」这类需要角色上下文的工具以谁的身份执行（缺省跟随 chat 动作的角色）。 */
+  tool?: { name: string; args?: Record<string, unknown>; characterId?: string };
 };
 
 export type BridgeRule = {
@@ -46,6 +56,17 @@ export type BridgeRule = {
   name: string;
   /** 匹配的数据类型；"*" 匹配全部 */
   matchType: string;
+  /**
+   * 只在这个词出现在信号正文里时才触发（空 = 不限）。
+   *
+   * 为什么需要它：信号类型太粗——「长时间使用」这一条会同时罩住刷抖音、
+   * 刷 B 站、看小说，用户想「只有刷抖音才提醒我」就配不出来。而应用名
+   * 恰好就在 payload 里（如「抖音 已连续使用 20 分钟」），所以按 payload
+   * 做一层关键词过滤就够，不必给每种应用各造一个信号类型。
+   *
+   * 多个词用 | 或 , 分隔，命中任一即触发（如「抖音|快手」）。
+   */
+  payloadFilter?: string;
   enabled: boolean;
   process: {
     mode: BridgeProcessMode;
@@ -57,6 +78,33 @@ export type BridgeRule = {
   actions: BridgeRuleActions;
   /** 触发间隔（分钟）：间隔内再次收到同信号只存档不执行；0/缺省 = 每次都触发 */
   cooldownMinutes?: number;
+  /**
+   * 延迟执行：信号收到后先等这么多分钟，再执行动作。0/缺省 = 立刻执行。
+   *
+   * 为什么需要它：「先安静一会儿再说」是很自然的需求——角色发现你熬夜，
+   * 不该立刻弹消息，而是十分钟后再提醒；外卖到了，隔五分钟再问他吃没吃。
+   * 延迟队列落 IndexedDB，App 中途关掉再打开，到点照样执行。
+   */
+  delayMinutes?: number;
+  /**
+   * 定时触发：不依赖任何外部信号，到点自己执行。
+   *
+   * 为什么需要它：在这之前，每一条规则都必须等一个「外面来的」信号，
+   * 于是安卓用户配不出「每天早上说句早安」这种最基本的事——那得靠 iPhone
+   * 快捷指令的定时自动化，而安卓没有那条线。定时触发把这件事收回本机。
+   *
+   * 配了 schedule 的规则不参与信号名匹配（matchType 被忽略）。
+   * 触发只在小手机开着或后台保活时发生——完全关闭时没有任何东西在跑。
+   */
+  schedule?: {
+    kind: "daily" | "weekly" | "interval";
+    /** daily/weekly 用：HH:MM */
+    time?: string;
+    /** weekly 用：0=周日 … 6=周六 */
+    weekday?: number;
+    /** interval 用：每隔多少分钟 */
+    minutes?: number;
+  };
   createdAt: string;
 };
 

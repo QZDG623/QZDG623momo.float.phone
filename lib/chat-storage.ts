@@ -65,6 +65,12 @@ export type ChatSession = {
     alias?: string;
     videoBackground?: string;
     voiceBackground?: string;
+    /** 视频通话角色形象：覆盖角色默认；IndexedDB 资产 ID */
+    callImage?: string;
+    /** 说话张嘴差分图（覆盖角色默认） */
+    callImageTalk?: string;
+    /** 眨眼闭眼差分图（覆盖角色默认） */
+    callImageBlink?: string;
     isBlacklisted?: boolean;
     customCSS?: string;
     isMuted?: boolean;
@@ -147,7 +153,14 @@ export type ChatMessage = {
         | "group_admin_notice"
         | "media_file"
         | `plugin:${string}`; // 聊天插件自定义消息类型（由注册该 kind 的插件渲染气泡）
-    origin?: "chat" | "reading_discuss" | "custom_app" | "custom_app_background" | "story_floating_phone";
+    /**
+     * 消息来源。call = 通话屏产生的消息（通话中的对话轮、用户从通话界面发的）。
+     *
+     * 用途：通话折叠需要区分「通话产生的」与「聊天室发的」——前者收进折叠条，
+     * 后者留在时间流里正常显示。此前没有这个区分，折叠按时间区间无差别全收，
+     * 于是通话期间在聊天室发的消息、卡片也被一起折进去了（用户实报）。
+     */
+    origin?: "chat" | "reading_discuss" | "custom_app" | "custom_app_background" | "story_floating_phone" | "call";
     mediaUrl?: string;
     mediaData?: {
         amount?: number;          // 红包/转账金额
@@ -227,6 +240,14 @@ export type ChatMessage = {
         xiaohongshuCoverIcon?: string;
         xiaohongshuTone?: string;
         callDuration?: string;    // 通话时长（如 05:23）
+        /** 用户手动标记的「通话开头」(右键菜单)。老通话留痕丢失时用它圈定区间起点。 */
+        callStartMarker?: boolean;
+        /**
+         * 通话语音留档引用（media-store://…）。通话屏把角色这句的原音存进媒体库后写在
+         * 这里，供「通话统计」直接复听原音，不必重新合成（音色/语气才和当时一致）。
+         * 老消息没有这个字段。媒体库清理由 lib/call-audio-storage.ts 的保留策略负责。
+         */
+        callAudioRef?: string;
         voiceDuration?: number;   // 语音条时长（秒）
         synthesizedFromText?: string; // 语音条当前音频对应的合成文本
         memoryContent?: string;   // 记忆写入内容
@@ -312,6 +333,10 @@ export type ChatMessage = {
 
 export type MeetingInviteCardConfig = {
     mode: "native" | "custom";
+    /** 是否每轮注入邀请见面提示词；默认 false（仅检测到相关话题时注入）。 */
+    enabled?: boolean;
+    /** 是否每轮注入私聊备注提示词；默认 false（仅检测到相关话题时注入）。 */
+    remarkEnabled?: boolean;
     /** 附加到私聊提示词中的邀请输出约定；固定控制标记仍由系统兜底。 */
     contract: string;
     /** 沙盒中运行的 HTML/CSS/JS；可用 window.STATUS_RAW / {{RAW}} 读取卡片数据。 */
@@ -344,6 +369,9 @@ export function resolveMeetingInviteCardConfig(settings?: ChatAppSettings): Meet
     const raw = settings?.meetingInviteCard;
     return {
         mode: raw?.mode === "custom" ? "custom" : "native",
+        // enabled / remarkEnabled 默认 false：不每轮注入，仅检测到相关话题时才注入
+        enabled: raw?.enabled === true ? true : false,
+        remarkEnabled: raw?.remarkEnabled === true ? true : false,
         contract: typeof raw?.contract === "string" ? raw.contract : DEFAULT_MEETING_INVITE_CONTRACT,
         renderHtml: typeof raw?.renderHtml === "string" ? raw.renderHtml : DEFAULT_MEETING_INVITE_RENDER,
         previewRaw: typeof raw?.previewRaw === "string" ? raw.previewRaw : DEFAULT_MEETING_INVITE_PREVIEW,

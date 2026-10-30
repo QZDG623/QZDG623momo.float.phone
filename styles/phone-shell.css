@@ -1125,7 +1125,10 @@
        让它约等于真实状态栏高度即可铺满。0 = 不上移（iOS 等能全屏的浏览器保持 0）。 */
     margin-top: calc(-1 * var(--status-bar-drop, 0px));
     transform: translate3d(0, calc(-1 * var(--mobile-keyboard-lift, 0px)), 0);
-    transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+    /* 移除 transform 过渡动画：Android 键盘弹出后该过渡会让 .phone-shell-wrap 在
+       点击交互期间持续移动（pointerdown→pointerup 间按钮被顶走数十像素），导致
+       Chrome 判断 pointerdown 与 pointerup 命中不同元素、click 落到 app-root 而
+       发送不触发。去掉过渡后抬升立即到位、按钮静止，click 命中与视觉一致。 */
     will-change: transform;
   }
 
@@ -1454,4 +1457,21 @@
 }
 .folder-dots .dot.active {
   background: color-mix(in srgb, var(--c-home-label, #ffffff) 85%, transparent);
+}
+
+/* ── 安卓壳（FloatShell）内 ─────────────────────────────────────────────
+   壳已经把系统状态栏藏起来了（MainActivity.applySystemStatusBarMode），
+   页面里的虚拟状态栏就是唯一的状态栏：
+     · 强制显示，避免「显示系统状态栏」开关把它一起藏掉后，两条滑块怎么拖都没反应；
+     · 背景保持透明，壁纸/页面直接透上来，顶部不再出现一条白色分界条；
+     · 「状态栏占位上移」在壳里也要真的生效（PWA 那条 margin-top:0 只在浏览器装机时用）。
+   注意：这些规则不放进移动端 media query——壳在部分云手机/大屏设备上
+   可能不满足 max-width:500px，放进去就又会失效。 */
+html[data-float-shell="1"] .phone-shell > .phone-status-bar {
+  display: grid !important;
+  background: transparent;
+}
+
+html[data-float-shell="1"] .phone-shell-wrap {
+  margin-top: calc(-1 * var(--status-bar-drop, 0px));
 }

@@ -1,269 +1,133 @@
-# AI Virtual Phone
+# 项目来源、致谢与二次开发说明
 
-一个基于 Next.js 的 AI 虚拟互动手机：在浏览器中模拟一部完整的手机，支持与你创建的 AI 角色进行仿真聊天、朋友圈互动与剧情创作。
+## 一、项目来源与继承关系
 
-主要功能：
+本仓库基于小笼包老师的原始项目，并承接末末老师的二次开发版本继续迭代。主要围绕 Android 原生能力、全局通话、安卓离线推送、安卓现实桥及数据与交互体验等方向进行扩展和改进。
 
-- 仿真聊天：私聊 / 群聊 / 朋友圈 / 语音消息 / 转账红包卡片，AI 角色有作息、记忆和长期关系
-- 创作系统：角色卡、世界书、预设、正则，附带桌面 AI 助手「小卷」帮你写这些内容
-- 剧情玩法：剧情模式、视觉小说、查手机、访谈、地图冒险、日记、便签墙
-- 扩展生态：应用市场（用 SDK 写自定义 APP）、游戏大厅、内置小游戏
-- 多媒体：AI 生图、Minimax 语音合成、网易云在线音乐（需自配 API）、3D 世界搭建（Tripo）
-- 个人云：可把云备份、微信助手、离线回复、定时消息、快捷动作与云端来电部署到用户自己的 Supabase
-- 现实桥：角色可调用用户映射的 iPhone 快捷指令，并在文本/图片结果回传后继续回复
-- 屏幕速聊（iOS）：通过辅助触控截取当前屏幕，在系统弹窗里与角色连续对话，并同步回唯一聊天窗口
-- 桌面美化：主题、壁纸、贴纸小组件、自定义 CSS，支持 PWA 安装到手机桌面
+## 二、上游项目的主要成果
 
-所有 LLM 调用都使用**你自己的 API key**，本项目不内置任何模型服务。
+### 1. 小笼包老师：原始项目与基础框架
 
-## 运行要求
+感谢小笼包老师建立项目的核心框架，为后续开发提供了基础，包括但不限于：
 
-- Node.js 20+（Next.js 15 要求 ≥ 18.18）
-- 任意 OpenAI 兼容的 LLM API（OpenAI / DeepSeek / 中转站等），或 Anthropic / Google Gemini 官方 API
+- 仿真手机界面与 AI 角色互动机制。
+- 私聊、群聊、朋友圈等社交体验。
+- 角色卡、世界书、预设、记忆及剧情创作相关能力。
+- 小手机内应用、多媒体及相关扩展机制。
+- 本地运行、网页部署与项目基础架构。
 
-## 快速开始（本地运行）
+原始项目地址：
+https://github.com/xiaolongbao0709/ai-virtual-phone
 
-```bash
-git clone -b main <repo-url>
-cd <repo-dir>
-npm install
-cp .env.example .env.local
-npm run dev
-```
+### 2. 末末老师：直接上游版本的持续开发
 
-浏览器打开 `http://localhost:3001`（默认端口 3001，可用 `PORT` 环境变量修改）。
+末末老师在原始项目基础上进行了持续的二次开发，进一步丰富了剧情机制、角色互动、记忆管理和数据保护等方面的体验。
 
-`.env.example` 已默认开启：
+主要涉及以下方向：
 
-```env
-NEXT_PUBLIC_SELF_HOSTED_MODE=true
-```
+- **剧情模式：** 剧情分页、分支、多人剧情与多人见面。
+- **剧情互动：** 动态邀请见面卡片、离线邀请及相关工具。
+- **剧情方案：** 公共方案仓库、方案备份恢复与迁移兼容。
+- **记忆与关系：** 记忆标签筛选、私聊仿真拉黑、角色对用户的备注。
+- **数据安全：** 修复聊天记录导入后数据被清空等问题，完善迁移保护。
+- **聊天体验：** 全局聊天设置、新消息音效、头像与邀请卡片等细节优化。
 
-这个模式跳过账号/激活码门禁，用本地单机账号直接进入，适合个人使用。其余环境变量全部可选，功能按需启用（见下表）。
+以上为主要功能方向的归纳，并非完整更新日志。具体功能的引入时间、实现范围及后续修改，应以上游代码和提交记录为准。
 
-## 首次使用
+直接上游仓库：
+https://github.com/jianchu-in/momo.float.phone
 
-进入应用后只差一步就能开聊：
+## 三、本仓库的二次开发方向与主要改进
 
-1. 打开**设置 → API 设置**，添加你的 LLM API（填 Base URL + API Key，支持 OpenAI 兼容接口、Anthropic、Google Gemini）；
-2. 创建或导入角色卡，开始聊天；
-3. 可选：在设置里继续配置生图、Minimax 语音、网易云音乐 API 等增强功能。
+以下内容主要介绍本人在继承上游项目后，持续开发、扩展、适配和维护的方向。
 
-## 部署到 Netlify / Vercel
+### 1. 全局通话与持续互动
 
-两个平台都可以直接导入本仓库部署：
+- 将通话状态提升为全局管理，避免切换会话时通话界面随聊天室卸载。
+- 增加可拖动、可缩放的通话小窗，并对接安卓原生浮窗。
+- 增加通话自动搭话、消息排队与补发机制。
+- 改进语音、视频及群聊通话体验。
+- 增加通话消息折叠规则、通话语音留档及相关状态同步。
+- 增加浮窗设置、主题配置、自检和故障诊断能力。
 
-1. 新建站点 / 项目，关联你 fork 或 clone 的仓库，选择 `main` 或 `test` 分支；
-2. 构建设置保持默认即可（Netlify 会自动读取仓库里的 `netlify.toml`；Vercel 自动识别 Next.js）；
-3. **在平台后台添加环境变量**（平台不会读取仓库里的 `.env.example`）：
+### 2. 安卓原生能力与 APK 适配
 
-   ```env
-   NEXT_PUBLIC_SELF_HOSTED_MODE=true
-   ```
+- 扩展 Android Shell 与网页端之间的原生通信桥。
+- 增加原生通知、通知点击直达会话及通知回复相关能力。
+- 增加系统级通话浮窗及相应生命周期处理。
+- 增加桌面小组件、设备感知与系统能力联动。
+- 改进状态栏、安全区域、权限处理和设备兼容性。
+- 维护安卓壳的版本号、构建流程及相关适配说明。
 
-4. 部署完成后打开站点，按「首次使用」配置即可。
+### 3. 离线推送与定时消息
 
-## 环境变量总表
+- 增加或完善离线推送长连接与原生通知链路。
+- 改进定时任务的保存、撤销、同步及服务端状态处理。
+- 增加推送自检、诊断与断线重连处理。
+- 改进通知内容、角色头像和会话跳转。
+- 处理通话期间主动消息与离线推送之间的冲突，减少重复或不合时宜的提醒。
 
-除 `NEXT_PUBLIC_SELF_HOSTED_MODE` 外全部可选，不填时对应功能自动隐藏或停用。
+### 4. 现实桥与设备联动
 
-| 变量 | 用途 |
-|---|---|
-| `NEXT_PUBLIC_SELF_HOSTED_MODE` | `true`=单机模式（推荐自部署开启）；`false`=启用账号/激活码门禁（需配 Supabase） |
-| `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | 站点账号、社区功能和现实桥邮件自动化使用的 Supabase 项目（服务端专用，勿放进 NEXT_PUBLIC）；应用内创建的个人云不需要把密钥填到这里 |
-| `MIXOLOGY_SUPABASE_URL` / `MIXOLOGY_SUPABASE_SERVICE_ROLE_KEY` | 独家特调专用的独立 Supabase 项目（酒材/配方/点赞/入柜/评论）。特调数据只走这里，不填则特调云端不开张，不会回退主库 |
-| `ACCOUNT_GATE_SECRET` | 账号门禁签名密钥，启用账号系统时设为随机长字符串 |
-| `VERIFY_ADMIN_KEY` | 成年审核/激活码管理后台密钥 |
-| `APP_MARKET_ADMIN_KEY` | 应用市场审核后台密钥（不填回退用 `VERIFY_ADMIN_KEY`） |
-| `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` / `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | 便签墙实时刷新用（anon key 本身可公开） |
-| `NEXT_PUBLIC_IMAGE_GEN_PROXY_URL` | 通用生图代理地址，需自己部署代理服务 |
-| `NEXT_PUBLIC_DEFAULT_NETEASE_API_BASE` | 网易云音乐 API 默认地址（NeteaseCloudMusicApi 兼容实例，请自行部署）。留空时在线音乐隐藏，用户也可在音乐 APP 设置里自填 |
-| `NEXT_PUBLIC_NETEASE_REAL_IP` | 网易云 API 的 X-Real-IP 参数（海外部署解锁地区限制用） |
-| `TRIPO_API_KEY` | 可选的服务端兜底，一般不用填——用户在世界搭建界面内自行填写 Tripo key |
-| `IMGBB_API_KEY` | 可选的服务端兜底，一般不用填——用户在应用内生图/图床设置里自行填写 |
-| `WEIXIN_PROXY` | 微信本地助手代理，见 `tools/weixin-local-assistant/README.md` |
-| `RESEND_API_KEY` / `REALITY_BRIDGE_EMAIL_FROM` / `SHORTCUT_EMAIL_VERIFICATION_SECRET` | 可选的现实桥“邮件自动”实验通道；普通推送快捷动作不需要 |
+- 扩展现实桥的设备感知、动作执行与结果反馈机制。
+- 增加快捷动作、任务调度和相关设置能力。
+- 完善设备端与云端之间的状态同步和异常处理。
+- 持续探索让角色不仅能够聊天，也能够在获得授权的情况下与现实设备及用户工作流联动。
 
-## 启用自己的 Supabase（可选云端功能）
+### 5. 数据、界面与稳定性改进
 
-账号、激活码、成年审核、便签墙、游戏大厅、应用市场、黑市等云端功能需要你自己的 Supabase 项目。推荐在 Supabase SQL Editor 直接执行 `docs/supabase-all-in-one.sql` 一键建齐全部云端功能（幂等脚本，重复执行不会破坏已有数据；粘贴后先确认最后一行是「全部结束」标记再 Run，防止复制被截断）。也可按需执行下列单个脚本：
+- 改进数据备份、恢复和存储相关流程。
+- 优化聊天、通话、缓存与消息同步之间的协作。
+- 持续调整界面样式、主题、桌面小组件及安卓端交互。
+- 记录实际开发中遇到的兼容性问题、修复方案与移植经验，降低后续维护和二次开发的难度。
 
-- `docs/account-supabase.sql`：账号、会话、激活码
-- `docs/verify-supabase.sql`：成年审核与审核图片桶（部署说明见 `docs/verify-setup.md`）
-- `docs/notewall-supabase.sql`：便签墙
-- `docs/game-hall-supabase.sql`：游戏大厅
-- `docs/custom-app-market-supabase.sql`：应用市场
-- `docs/black-market-supabase.sql`：黑市
-- `docs/online-play-supabase.sql`：多人联机（自定义APP/游戏的实时房间与云端共享；已并入一体脚本，另需站点环境变量 `SUPABASE_ANON_KEY`）
-- `docs/moderation-supabase.sql`：内容管理（举报/管理员/下架/封号；已并入一体脚本，执行后用 SQL 把自己的账号 role 设为 admin，即可在 设置 → 管理中心 处理举报）
-- `docs/push-supabase.sql`：现实桥「邮件自动」所需的表已并入一体脚本；这个文件本身是旧的站点共享推送，新部署不要单独执行
+以上是本项目后续开发的重点方向，并非对所有文件的原创性声明。部分改动是在原有实现上继续完善，具体归属以代码和提交记录为准。
 
-然后关闭单机模式并填入服务端密钥：
+## 四、使用前请注意
 
-```env
-NEXT_PUBLIC_SELF_HOSTED_MODE=false
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-ACCOUNT_GATE_SECRET=your-random-long-secret
-# 可选：启用多人联机（Project Settings → API 的 anon public key）
-SUPABASE_ANON_KEY=your-anon-key
-```
+### 1. 完整体验需要安装 APK
 
-不要把 `.env.local` 提交到 Git。
+网页端可以提供基础交互，但系统通知、原生浮窗、桌面小组件和部分设备联动依赖 Android 原生壳及系统权限。
 
-## 个人云、离线推送与微信接入
+如果希望体验完整的安卓原生功能，应使用项目提供的 Android APK 构建与安装方式。仅访问网页不等于拥有完整的原生能力。
 
-这套功能不要求站点维护者把所有用户数据放进同一个 Supabase。每位用户可在
-**设置 → 云服务部署**里粘贴自己的 Supabase Access Token、选择自己的组织，应用会：
+Android 壳说明与构建入口：
+https://github.com/doremy1203/doremy.float.phone/blob/main/android-shell/README.md
 
-1. 自动创建一个名为 `AI Phone Personal Cloud` 的独立项目；
-2. 按用户勾选范围部署云备份、微信 Edge Function、离线推送与快捷动作函数；
-3. 把该项目的地址和密钥只保存在用户自己的小手机数据中，Access Token 仅在本次部署请求中透传，不保存；
-4. 用项目标记和数据库表检查阻止误装进已有业务库。
+### 2. APK 签名必须妥善保存
 
-个人云与上文的站点运营库是两件事：`SUPABASE_URL` 用于账号、市场等站点级功能；
-个人云由用户在界面中创建，默认不会复用或修改站点运营库。自部署者只想个人使用时，
-保持 `NEXT_PUBLIC_SELF_HOSTED_MODE=true`，无需先配置站点运营库，也能使用个人云。
+如果计划长期使用自己的构建版本，应提前配置并保管自己的 APK 签名密钥。
 
-部署完成后，在聊天信息页开启「离线推送与定时消息」；微信 Bot 则在
-**设置 → 微信接入**中添加。云端与本地使用相同的角色运行包，微信消息、离线回复、
-快捷动作结果和来电留痕会按因果顺序合并回小手机。
+后续更新包必须使用与已安装版本兼容的签名。签名不一致时，通常无法直接覆盖安装，可能需要先卸载旧版本；卸载可能导致仅保存在本地的数据丢失。
 
-### iOS 屏幕速聊（辅助触控双击）
+请勿将签名密钥、密码等敏感文件提交到公开仓库。
 
-屏幕速聊是现实桥的一个 iOS 入口：双击辅助触控悬浮球后，快捷指令截取当前屏幕，
-角色的回复直接显示在系统弹窗里；你可以在弹窗中继续回复。每一轮对话都会按顺序写回
-该角色原有的唯一聊天窗口，不会每 15/30 轮另开一段会话。
+### 3. 数据库和云函数需要单独更新
 
-使用前请先在 **设置 → 云服务部署**完成或重新执行一次个人云部署。屏幕速聊要求
-个人云 Schema v3；旧版个人云不会被静默复用，页面会提示重新部署。部署完成后：
+本项目涉及数据库 Schema、SQL、Edge Functions 或其他云端逻辑更改，需要根据对应的部署说明执行相关更新。否则可能出现网页或 APK 已经更新，但云端仍使用旧结构、旧函数的情况。
 
-1. 打开 **现实桥 → 屏幕速聊**，开启功能并选择一个角色；
-2. 在第三步点“一键导入屏幕速聊”，导入项目提供的通用 iCloud 快捷指令；
-3. 按导入问题填写页面显示的“接口地址”和“令牌”。共享快捷指令本身不包含你的地址、
-   令牌或角色资料；
-4. 到 iPhone **设置 → 辅助功能 → 触控 → 辅助触控 → 轻点两下**，选择“屏幕速聊”；
-5. 首次运行时允许“截屏”“访问网络”和“显示提醒”等系统权限。
+本项目的云部署流程已针对覆盖更新进行优化，可以通过重新输入 Token 进行更新部署。更新前应确认个人云与相关数据已经妥善备份。
 
-如果一键导入不可用，页面仍保留完整的手动搭建步骤。该功能不需要 Resend，也不需要
-站点运营库；它只访问用户自己创建的个人云项目。截图原图不会写入 Supabase 数据库或
-Storage，只存在于本次 Edge Function 内存和本次模型请求中。个人云仅暂存尚未合并回
-小手机的文本轮次；应用启动或从后台回到前台时会立即补拉，而不是持续高频轮询。
+### 4. 安卓设备兼容性存在差异
 
-### iOS 现实桥：通知点击运行
+不同品牌和系统版本对悬浮窗、通知、后台运行、闹钟、桌面小组件等能力的权限与限制不同。即使安装成功，也不代表所有原生功能都能在每台设备上完全一致地工作。
 
-现实桥默认使用“通知点击运行”：角色触发快捷动作后，个人云向 iPhone 发送系统通知，
-用户点击通知即可运行快捷指令。该模式随上面的个人云一起部署，**不需要 Resend**，
-也不需要额外的站点 Supabase 环境变量，是推荐的默认选择。
+本项目的主要参考设备为荣耀 500 Pro。其他设备可能需要额外的权限配置、系统设置或针对性适配。
 
-### iOS 现实桥：邮件自动运行（实验）
+### 5. Android SDK 版本说明
 
-“邮件自动”利用 iOS 的“收到指定邮件时立即运行”自动化，因此必须有服务负责发送触发
-邮件。目前项目使用 [Resend](https://resend.com)：
+当前配置为：
 
-- 自己部署、自己使用时，由站点主人配置一次 Resend。
-- 多人共用一个站点时，由站点运营者配置一次；普通用户只在小手机里验证接收邮箱，
-  不需要各自注册 Resend。
-- 不配置 Resend 不影响云备份、微信、离线回复或“通知点击运行”，只是邮件模式不可用。
+- `minSdk 26`：最低支持 Android 8.0。
+- `targetSdk 34`：应用声明的目标 Android API 级别。
+- `compileSdk 36`：编译时使用的 Android API 级别。
 
-#### 1. 配置 Resend
+`compileSdk 36` 并不意味着设备必须运行 Android 16；最低系统要求由 `minSdk` 决定。实际可用功能仍受设备系统和权限策略影响。
 
-1. 注册 Resend，在 Domains 中添加自己拥有的域名。推荐使用独立子域名，例如
-   `notify.example.com`。
-2. 按页面提示添加 DNS 记录，等待状态变成 `Verified`。参见
-   [Resend 域名验证文档](https://resend.com/docs/dashboard/domains/introduction)。
-3. 在 [Resend API Keys](https://resend.com/api-keys) 创建 API Key。密钥只显示一次，
-   请立即保存，不要提交到 Git。
+## 五、致谢
 
-域名验证后可以直接使用该域名下的任意发件地址，例如
-`bridge@notify.example.com`，该地址不要求拥有独立收件箱。
+再次感谢小笼包老师提供原始项目基础，感谢末末老师在直接上游版本中的持续开发与维护。
 
-#### 2. 配置站点环境变量与数据库
+本仓库只是在两位老师的成果上，做了一些维护、补充和适配。开源项目的贡献关系有时比较复杂，如果本说明中存在来源标注不清或归属错误，欢迎指出，我会及时更正。
 
-在 Netlify / Vercel 的环境变量中增加：
-
-```env
-RESEND_API_KEY=re_xxxxxxxxx
-REALITY_BRIDGE_EMAIL_FROM="Float Reality Bridge <bridge@notify.example.com>"
-SHORTCUT_EMAIL_VERIFICATION_SECRET=独立随机长字符串
-```
-
-可用下面的命令生成验证码签名密钥：
-
-```bash
-openssl rand -hex 32
-```
-
-以上都是服务端秘密，不要添加 `NEXT_PUBLIC_` 前缀。发件邮箱的域名必须与 Resend
-中已经验证的域名一致。
-
-邮件验证记录和邮件型快捷指令目前存放在**站点 Supabase**，不是用户一键创建的个人云。
-因此还需要配置：
-
-```env
-SUPABASE_URL=https://your-site-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-```
-
-然后在这个站点 Supabase 项目的 SQL Editor 执行
-[`docs/supabase-all-in-one.sql`](./docs/supabase-all-in-one.sql)（邮件自动所需的表已在其中；
-跑过一体脚本的直接重跑一遍即可，幂等），再重新部署站点。若已为账号或其他
-站点功能配置过这两个变量，可以继续使用同一个站点项目。注意这里说的是部署环境的
-服务端变量，不是应用内「云服务部署」一键创建的个人云——两者是不同的 Supabase 项目。不要把 `service_role` 密钥
-交给浏览器或写进任何 `NEXT_PUBLIC_*` 变量。
-
-#### 3. 配置 iPhone
-
-1. 打开“现实桥 → iOS 快捷动作”，将送达方式选为“邮件自动（实验）”。
-2. 填写 iPhone“邮件”App 能及时收信的邮箱，接收并输入六位验证码。
-3. 把页面显示的发件人加入白名单，避免触发邮件进入垃圾箱。
-4. 在“快捷指令 → 自动化”中新建“电子邮件”自动化：发件人填写页面显示的地址，
-   主题选择“包含”页面显示的主题标记，运行方式选“立即运行”。
-5. 自动化动作设置为运行页面生成的快捷指令，并把邮件正文作为快捷指令输入。
-
-为减少延迟，推荐使用在 iPhone 邮件 App 中支持实时推送的 iCloud 或 Exchange 邮箱。
-首次运行仍可能要求 iOS 权限确认，部分动作在锁屏状态下也可能受到系统限制，因此该
-模式仍标记为实验功能。
-
-维护者修改云函数源文件后运行：
-
-```bash
-npm run push:build-dist   # 生成浏览器一键部署包
-npm run check:push        # 校验源文件与部署包一致，且不含私有站点地址
-npm run weixin:build-dist # 生成微信本地/云端分发包
-npm run check:weixin      # 校验微信提示词与分发文件
-```
-
-## 分支选择
-
-本仓库长期保留两个设备兼容版本：
-
-- `main`：正常设备版
-- `test`：兼容设备版，部分设备全屏或显示异常时部署此分支
-
-## 常用命令
-
-```bash
-npm run dev     # 本地开发（端口 3001）
-npm run build   # 生产构建
-npm run start   # 生产运行
-npm run lint    # 代码检查
-npm run check:push # 校验个人云部署包
-```
-
-## License
-
-本项目采用 GNU Affero General Public License v3.0 only（AGPL-3.0-only）开源。详见 [LICENSE](./LICENSE)。
-
-## Credits
-
-本项目为独立实现，但部分产品设计和系统抽象受 SillyTavern 启发，包括预设、正则处理、世界书 / lorebook / WorldInfo 等概念。
-
-- SillyTavern: https://github.com/SillyTavern/SillyTavern
-- SillyTavern 使用 AGPL-3.0 许可证。
-
-字体、贴纸素材、3D 模型等第三方资源的授权说明见 [NOTICE](./NOTICE)。
-
-## 备注
-
-`NEXT_PUBLIC_*` 变量会打包进浏览器代码、完全公开。不要把 Supabase `service_role`、后台管理密钥、第三方 API 私钥写进任何 `NEXT_PUBLIC_*` 变量。
+也希望大家在尊重原有成果的前提下，继续探索和开发。

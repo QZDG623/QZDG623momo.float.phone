@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
-import { ChatSession, ChatMessage, loadChatMessages, pushChatMessage, getLatestCharacterStateValues, resolveChatCharacterAvatar } from "@/lib/chat-storage";
+import { useState, useRef, useEffect, useCallback, type CSSProperties } from "react";
+import { ChatSession, ChatMessage, loadChatMessages, pushChatMessage, getLatestCharacterStateValues, updateChatMessage, deleteChatMessage } from "@/lib/chat-storage";
 import { getStatusRegionConfig, isCustomStatusRegionActive } from "@/lib/chat-status-region";
 import type { StateValue } from "@/lib/chat-storage";
 import { parseStateValues, mergeStateValues } from "@/lib/state-value-parser";
@@ -9,10 +9,12 @@ import { parseAIResponse } from "@/lib/rich-message-parser";
 import { generateChatCompletion, flattenCompletionResult, ChatEngineError } from "@/lib/chat-engine";
 import { resolveUserIdentity } from "@/lib/settings-storage";
 import { cancelFollowUp } from "@/lib/follow-up-service";
+import { persistCallAudio, releaseCallAudioRef } from "@/lib/call-audio-storage";
+import { suspendBailoutsForCall } from "@/lib/push-bailout-client";
 import { createSTTSession, type STTSession } from "@/lib/stt-service";
 import { resolveVoiceConfig, synthesizeSpeech, playAudioBlob, playAudioBlobViaMediaElement, setCallAudioSessionActive } from "@/lib/tts-service";
 import { isCallRecordingSupported, resolveCloudSttConfig } from "@/lib/stt-cloud";
-import { useHoldToTalk } from "./use-hold-to-talk";
+import { useContinuousVoice } from "./use-continuous-voice";
 import { suspendKeepAliveForCall, resumeKeepAliveAfterCall } from "@/lib/use-weixin-bridge";
 import { BilingualTextBlock } from "./message-bubble";
 import { splitBilingualText } from "@/lib/bilingual-text";
@@ -23,6 +25,12 @@ import { isAndroidBrowser, isIOSDevice } from "./voice-input-platform";
 import { CallVolumeControl } from "./call-volume-control";
 import { startIncomingCallVibration } from "@/lib/call-vibration";
 import { useCallScreenSounds } from "@/lib/chat-sound";
+import { CallMiniWindow } from "./call-mini-window";
+import { CallSubtitleItem, type CallSubtitleAction } from "./call-subtitle-item";
+import { type CallAutoChatConfig, MAX_TURNS_LIMIT, MIN_INTERVAL_SECONDS, loadCallAutoChatConfig, randomAutoChatDelaySeconds, saveCallAutoChatConfig } from "@/lib/call-auto-chat";
+import { isShellEnvironment, stopShellCallOverlay } from "@/lib/shell-call-overlay";
+import { useShellCallOverlay } from "./use-shell-call-overlay";
+import { useCallReplyQueue } from "./use-call-reply-queue";
 
 // ── Types ───────────────────────────────────────────
 
@@ -38,6 +46,11 @@ type SubtitleEntry = {
     id: string;
     role: "user" | "assistant";
     text: string;
+    /** 这条字幕对应的聊天消息 id。编辑 / 删除 / 重新生成都要落到真实记录上，
+     *  所以从 1.0.10 起不再用假 id（原先角色字幕是 ai-<时间戳>，定位不到记录）。 */
+    messageIds?: string[];
+    /** 实际送去合成语音的文本；重听时用它重新合成。用户的话没有这一项。 */
+    speechText?: string;
 };
 
 type VoiceCallScreenProps = {
@@ -46,12 +59,40 @@ type VoiceCallScreenProps = {
     onEnd: () => void;
     onConnect?: () => void;
     initiator?: "user" | "character";
-    /** 通话是否处于缩小的悬浮窗状态：暂停麦克风监听/计时/语音播放，仅显示背景+名字 */
+    /** 通话是否处于缩小的悬浮窗状态：通话继续（识别/播放/计时不停），界面缩为小窗 */
     minimized?: boolean;
-    /** 点击左上角返回键：请求缩小为悬浮窗（通话逻辑冻结，不挂断） */
+    /** 点击左上角返回键：请求缩小为悬浮窗（通话继续，不挂断） */
     onMinimize?: () => void;
     /** 点击悬浮窗：请求恢复为全屏通话界面 */
     onRestore?: () => void;
+};
+
+/** 自动搭话设置里的数字输入框样式（深底浅字，随面板走） */
+const AUTO_CHAT_INPUT_STYLE: CSSProperties = {
+    width: 66,
+    padding: "4px 6px",
+    borderRadius: 8,
+    border: "1px solid rgba(255,255,255,0.22)",
+    background: "rgba(255,255,255,0.1)",
+    color: "#fff",
+    fontSize: 12,
+    textAlign: "center",
+};
+
+/** 自动搭话按钮的默认落点（可拖动，拖动后位置记在本地）。
+ *  默认靠右上：原先放左上时和「缩小通话」返回键叠在一起，返回键被挡住点不到。 */
+const AUTO_CHAT_DEFAULT_POS: { x: number | null; y: number } = { x: null, y: 104 };
+const AUTO_CHAT_POS_KEY = "call-auto-chat-btn-pos-v1";
+
+/** 自动搭话按钮/面板的容器基础样式（具体位置由拖动状态决定） */
+const AUTO_CHAT_BOX_BASE: CSSProperties = {
+    position: "absolute",
+    zIndex: 30,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-end",
+    gap: 6,
+    touchAction: "none",
 };
 
 function stripBilingualForSpeech(text: string): string {
@@ -65,7 +106,7 @@ function stripBilingualForSpeech(text: string): string {
 
 export function VoiceCallScreen({ session, character, onEnd, onConnect, initiator = "user", minimized = false, onMinimize, onRestore }: VoiceCallScreenProps) {
     // iOS 保留 Web Speech 免提 + Web Audio 播放（麦克风会话共存的老方案）；
-    // 其余设备改「按住说话 + 云端转写」，播放走媒体元素（音量键可控、无静音拨键坑）。
+    // 其余设备改「免提连续监听 + 云端转写」，播放走媒体元素（音量键可控、无静音拨键坑）。
     // 没配 OpenAI 兼容识别时回落旧行为（安卓=文字输入）。
     const iosDeviceRef = useRef(isIOSDevice());
     const iosDevice = iosDeviceRef.current;
@@ -87,6 +128,44 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
     const [typedText, setTypedText] = useState("");
     const [bgImageResolved, setBgImageResolved] = useState<string | null>(null);
     const [showSttWarning, setShowSttWarning] = useState(false);
+    // 正在重听的字幕 id（按钮据此高亮）
+    const [replayingId, setReplayingId] = useState<string | null>(null);
+
+    // 已合成音频按字幕 id 缓存：重听直接放，不重复烧 TTS 额度。
+    // 上限 20 段——一次长通话能攒下几十段，全留着内存扛不住，丢最旧的。
+    const audioCacheRef = useRef<Map<string, Blob>>(new Map());
+    const cacheAudio = (id: string, blob: Blob) => {
+        const cache = audioCacheRef.current;
+        cache.set(id, blob);
+        while (cache.size > 20) {
+            const oldest = cache.keys().next().value;
+            if (oldest === undefined) break;
+            cache.delete(oldest);
+        }
+    };
+    // 自动搭话：进通话时读一次配置；改动即时存盘并热生效
+    const [autoChatConfig, setAutoChatConfig] = useState<CallAutoChatConfig>(() => loadCallAutoChatConfig());
+    const [showAutoChatPanel, setShowAutoChatPanel] = useState(false);
+    // 安卓壳里：切到别的 App 时用原生浮窗顶上（浮窗权限未开时给一条引导）。
+    // 具体接线与引导标记由 useShellCallOverlay 提供，见下方调用处。
+    // 自动搭话按钮的位置（可拖动，拖动后记在本地，下次通话沿用）
+    const [autoChatPos, setAutoChatPos] = useState<{ x: number | null; y: number }>(() => {
+        if (typeof window === "undefined") return { ...AUTO_CHAT_DEFAULT_POS };
+        try {
+            const raw = window.localStorage.getItem(AUTO_CHAT_POS_KEY);
+            if (!raw) return { ...AUTO_CHAT_DEFAULT_POS };
+            const parsed = JSON.parse(raw) as { x?: number | null; y?: number };
+            // 旧版本可能存下了超出屏幕的位置，读出来先夹回可视区域
+            const maxX = Math.max(0, window.innerWidth - 150);
+            const maxY = Math.max(0, window.innerHeight - 120);
+            return {
+                x: typeof parsed.x === "number" ? Math.min(Math.max(0, parsed.x), maxX) : null,
+                y: Math.min(Math.max(0, typeof parsed.y === "number" ? parsed.y : AUTO_CHAT_DEFAULT_POS.y), maxY),
+            };
+        } catch {
+            return { ...AUTO_CHAT_DEFAULT_POS };
+        }
+    });
 
     const sttRef = useRef<STTSession | null>(null);
     const audioAbortRef = useRef<(() => void) | null>(null);
@@ -97,6 +176,24 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
     const stateRef = useRef<string>("CONNECTING");
     const interimTextRef = useRef<string>("");  // ref 版本，闭包安全
     const sttWarningShownRef = useRef(false);
+    // 自动搭话：下一次可开口的时刻（毫秒时间戳）
+    const autoChatDeadlineRef = useRef<number>(0);
+    // 本次通话已自动搭话条数（用户一开口清零）
+    const autoTurnsRef = useRef(0);
+    // 角色连着几轮没说出内容：等待时长按此翻倍，避免空转连发
+    const emptyAutoTurnsRef = useRef(0);
+    // 配置的 ref 快照：心跳里读最新值，不必因设置变化重建定时器
+    const autoChatConfigRef = useRef<CallAutoChatConfig>(autoChatConfig);
+    // handleHangup 依赖 callDuration（每秒都变），直接进 effect 依赖会让监听器
+    // 每秒重装一次；用 ref 转发，订阅只建立一次。
+    // （本次通话 id、原生事件订阅、计时校准都交给 useShellCallOverlay 了）
+    const hangupRef = useRef<() => void>(() => {});
+    // 时长的 ref 快照：同步给原生浮窗时读，避免把每秒变化的 callDuration 塞进 effect 依赖
+    const callDurationRef = useRef(0);
+    useEffect(() => { callDurationRef.current = callDuration; }, [callDuration]);
+    // 自动搭话按钮的拖动状态
+    const autoChatDragRef = useRef<{ id: number; sx: number; sy: number; ox: number; oy: number; moved: boolean } | null>(null);
+    const autoChatBoxRef = useRef<HTMLDivElement | null>(null);
     const subtitleScrollRef = useRef<HTMLDivElement>(null);
     const messagesRef = useRef<ChatMessage[]>([]);
     const _initUi = resolveUserIdentity(session.contactId, "chat");
@@ -106,13 +203,16 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
     useEffect(() => { stateRef.current = callState; }, [callState]);
     useEffect(() => { minimizedRef.current = minimized; }, [minimized]);
 
-    // 缩小为悬浮窗：冻结通话——停止监听、打断在播放的语音
+    // 缩小为悬浮窗：通话继续，不再「冻结」。
+    //
+    // 旧实现把缩小当成挂起——中止识别、打断在播放的语音、停掉计时，于是悬浮窗
+    // 只是一个空壳：角色正在说的那句被硬切，之后也再没有声音，用户看到的就是
+    // 「一缩小就没声音」。真实手机上通话缩成小窗后是继续通话的，这里对齐：
+    // 播放不打断，识别与计时照常，悬浮窗就是通话中的小窗。
     useEffect(() => {
         if (!minimized) return;
-        if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
+        // 只清掉界面上的临时字幕；通话本身（播放 / 识别 / 计时）保持运行。
         setInterimText("");
-        if (audioAbortRef.current) { audioAbortRef.current(); audioAbortRef.current = null; }
-        if (window.speechSynthesis) window.speechSynthesis.cancel();
     }, [minimized]);
 
     // 来电等待接听：循环振动（开关在聊天主页，iOS 网页不支持自动无效果）
@@ -139,6 +239,7 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
         return () => {
             stateRef.current = "ENDED";
             if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
+            continuousVoice.stop();
             if (audioAbortRef.current) { audioAbortRef.current(); audioAbortRef.current = null; }
             setCallAudioSessionActive(false);
         };
@@ -195,13 +296,9 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
             callStartRef.current = Date.now();
         }
 
-        // 缩小为悬浮窗：冻结计时显示，不再推进
-        if (minimized) {
-            if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-            if (pausedAtRef.current === null) pausedAtRef.current = Date.now();
-            return;
-        }
-        // 从悬浮窗恢复：把冻结期间流逝的时间补回起点，避免时长跳变
+        // 悬浮窗不再冻结计时：通话在后台继续，时长就该继续走。
+        // pausedAtRef 的补偿保留着——若某次会话在旧版逻辑下进入过冻结态，
+        // 恢复时仍能把那段时长补回起点，不会出现时长跳变。
         if (pausedAtRef.current !== null) {
             callStartRef.current += Date.now() - pausedAtRef.current;
             pausedAtRef.current = null;
@@ -220,6 +317,10 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
 
     useEffect(() => {
         cancelFollowUp(session.id);
+        // 通话期间不打扰：撤掉这个会话已挂在服务端的离线预约。
+        // 通话里系统看不见你的文字回复，会误判成沉默、到点弹一条主动消息
+        //（只在通知里出现，聊天室里没有对应记录——人明明在电话里聊着）。
+        void suspendBailoutsForCall(session.id);
 
         // Resolve user name
         const ui = resolveUserIdentity(session.contactId, "chat");
@@ -289,7 +390,13 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
 
     // ── AI response processing (same logic as chat-room) ──
 
-    const processAIResponse = useCallback((aiResponseText: string): { cleanParts: string[]; stateValues: StateValue[] } => {
+    const processAIResponse = useCallback((aiResponseText: string): { cleanParts: string[]; stateValues: StateValue[]; messageIds: string[]; speechMessageIds: string[] } => {
+        // 本轮回合落进聊天记录的消息 id。字幕要带着它们，编辑 / 删除 / 重新生成
+        // 才能定位到真实记录——而不只是改屏幕上那一行字。
+        const createdMessageIds: string[] = [];
+        // 本轮真正「被朗读」的消息 id：原音留档只挂在这些消息上。
+        // 贴纸、红包这类没有台词的富媒体消息不挂，免得复听按钮重复又对不上语音。
+        const speechMessageIds: string[] = [];
         // Use shared parseAIResponse for full rich media support (stickers, quotes, etc.)
         const previousState = getLatestCharacterStateValues(session.contactId);
 
@@ -316,8 +423,10 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                 innerMonologue,
                 stateValues: stateValues.length > 0 ? stateValues : undefined,
                 freshStateValues,
+                origin: "call",
             });
             messagesRef.current = [...messagesRef.current, aiMsg];
+            createdMessageIds.push(aiMsg.id);
         } else {
             const newMsgs = chatParts.map((part, idx) =>
                 pushChatMessage({
@@ -326,6 +435,8 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                     content: part.content,
                     mediaType: part.mediaType,
                     mediaData: part.mediaData,
+                    // 标记来源为通话：折叠只收这类消息
+                    origin: "call",
                     statusPanel: idx === 0 && statusPanel ? statusPanel : undefined,
                     statusRegionMode: idx === 0 && statusPanel ? statusRegionMode : undefined,
                     innerMonologue: idx === 0 && innerMonologue ? innerMonologue : undefined,
@@ -334,30 +445,65 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                 })
             );
             messagesRef.current = [...messagesRef.current, ...newMsgs];
+            createdMessageIds.push(...newMsgs.map(m => m.id));
+            chatParts.forEach((part, idx) => {
+                if (!part.mediaType && part.content.trim() && newMsgs[idx]) {
+                    speechMessageIds.push(newMsgs[idx].id);
+                }
+            });
         }
+        window.dispatchEvent(new CustomEvent("chat-messages-updated", { detail: { sessionId: session.id } }));
 
         // Return clean text parts for TTS (exclude rich media content)
         const cleanParts = chatParts
             .filter(p => !p.mediaType && p.content.trim())
             .map(p => p.content);
 
-        return { cleanParts, stateValues };
+        return { cleanParts, stateValues, messageIds: createdMessageIds, speechMessageIds };
     }, [session.id, session.contactId]);
+
+    // ── 自动搭话：安排下一次主动开口 ──────────────────
+    //
+    // 每次角色说完（或空转一趟）都调一次：按配置在 [min, max] 里随机取间隔，
+    // 算出「下一次可开口的时刻」。真人是忽快忽慢的，固定节拍像定时器。
+    // 空转那几轮按翻倍惩罚（最多 4 倍），别让它在没人听时连珠炮。
+    const scheduleNextAutoChat = useCallback(() => {
+        const config = autoChatConfigRef.current;
+        if (!config.enabled) {
+            autoChatDeadlineRef.current = 0;
+            return;
+        }
+        const backoff = 1 + Math.min(emptyAutoTurnsRef.current, 3);
+        autoChatDeadlineRef.current = Date.now() + randomAutoChatDelaySeconds(config) * backoff * 1000;
+    }, []);
 
     // ── Full conversation turn ──────────────────────
 
     const runConversationTurn = useCallback(async (userText?: string) => {
+        // 用户开口：自动搭话重新计数（上限按「你开口后」重新算）
+        if (userText) {
+            autoTurnsRef.current = 0;
+            emptyAutoTurnsRef.current = 0;
+            autoChatDeadlineRef.current = 0;
+        }
+
         // 1. Save user message (skip for initial greeting)
         if (userText) {
             const userMsg = pushChatMessage({
                 sessionId: session.id,
                 role: "user",
                 content: userText,
+                // 标记来源为通话：折叠只收这类消息，通话期间在聊天室发的留在时间流
+                origin: "call",
             });
             messagesRef.current = [...messagesRef.current, userMsg];
+            // 通知聊天室刷新：通话屏在聊天室之外（CallLayer），不广播的话
+            // 通话中落库的消息要等挂断（chat-call-ended）才会出现在聊天室里，
+            // 折叠条也就一直不更新（用户实报「要挂掉才同步」）。
+            window.dispatchEvent(new CustomEvent("chat-messages-updated", { detail: { sessionId: session.id } }));
 
             // Add user subtitle
-            setSubtitles(prev => [...prev, { id: userMsg.id, role: "user", text: userText }]);
+            setSubtitles(prev => [...prev, { id: userMsg.id, role: "user", text: userText, messageIds: [userMsg.id] }]);
         }
 
         // 2. Switch to PROCESSING
@@ -374,26 +520,27 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
             if (stateRef.current === "ENDED") return;
 
             // 4. Process response
-            const { cleanParts } = processAIResponse(aiResponseText);
+            const { cleanParts, messageIds, speechMessageIds } = processAIResponse(aiResponseText);
             const displayText = cleanParts.join("\n");
             const speechText = stripBilingualForSpeech(displayText);
 
             if (!displayText) {
+                // 这轮角色没说出内容：下次等更久，避免空转连发
+                emptyAutoTurnsRef.current += 1;
+                scheduleNextAutoChat();
                 setCallState("IDLE");
                 return;
             }
 
             // 5. Add AI subtitle
+            // 带上 messageIds 与实际朗读文本：前者让长按菜单能改到真实记录，
+            // 后者让「重听」可以重新合成（不必从渲染后的富文本里再猜一遍）。
             const subtitleId = `ai-${Date.now()}`;
-            setSubtitles(prev => [...prev, { id: subtitleId, role: "assistant", text: displayText }]);
+            setSubtitles(prev => [...prev, { id: subtitleId, role: "assistant", text: displayText, messageIds, speechText }]);
 
-            // 缩小为悬浮窗期间收到的回复：只静默记录文字，不播放语音
-            if (minimizedRef.current) {
-                setCallState("IDLE");
-                return;
-            }
-
-            // 6. TTS
+            // 6. TTS —— 缩成悬浮窗也照常播。
+            // 原先这里遇到小窗直接静默返回，于是「正在生成时退出全屏」那句话
+            // 永远没声音。用户要的是通话继续，语音就该继续。
             setCallState("AI_SPEAKING");
 
             const voiceConfig = resolveVoiceConfig(session.contactId);
@@ -403,6 +550,26 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                     if (stateRef.current === "ENDED") return;
 
                     if (audioBlob) {
+                        // 存一份给「重听」用：不然每次重听都要重新调一次 TTS API，
+                        // 既慢又费额度。缓存满了自动丢最旧的（见 cacheAudio）。
+                        cacheAudio(subtitleId, audioBlob);
+                        // 落库留档：音频本体进媒体库，引用写进这条消息的 mediaData。
+                        // 缓存是内存临时品、挂断即失；落库之后「通话统计」才可能复听原音
+                        // ——宿主代播 voice.play 支持 media-store:// 引用，音频不过通信桥。
+                        void persistCallAudio(audioBlob, {
+                            sessionId: session.id,
+                            characterId: session.contactId,
+                        }).then(ref => {
+                            if (!ref) return;
+                            // 一轮可能出多段文本，而语音是整轮合一次：挂在第一段上。
+                            const targetId = speechMessageIds[0];
+                            if (!targetId) return;
+                            const target = loadChatMessages(session.id).find(item => item.id === targetId);
+                            if (!target) return;
+                            updateChatMessage(targetId, {
+                                mediaData: { ...(target.mediaData || {}), callAudioRef: ref },
+                            });
+                        });
                         const { promise, abort } = playCallAudio(audioBlob);
                         audioAbortRef.current = abort;
                         await promise;
@@ -414,6 +581,8 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
             }
 
             if (stateRef.current !== "ENDED") {
+                emptyAutoTurnsRef.current = 0;
+                scheduleNextAutoChat();
                 setCallState("IDLE");
             }
         } catch (error: any) {
@@ -424,15 +593,60 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                     role: "assistant",
                     text: `⚠️ ${error?.message || "发送失败"}`,
                 }]);
+                scheduleNextAutoChat();
                 setCallState("IDLE");
             }
         }
-    }, [session, processAIResponse, playCallAudio]);
+    }, [session, processAIResponse, playCallAudio, scheduleNextAutoChat]);
+
+    // ── 安卓壳原生浮窗 ──────────────────────────────
+    //
+    // 原实现在这里手写接线，有两个坑：
+    //   1. 依赖数组里放了 callState。通话中状态每秒都在 IDLE / 聆听 / 思考 / 说话
+    //      之间跳，effect 每跳一次就 stop + start，浮窗被整个拆了重建、计时归零，
+    //      表现为「一说话时长就跳、不说话又变回 0」。
+    //   2. 启动时没带 elapsedSeconds，原生只能从 0 起数。
+    // 现已统一改用 useShellCallOverlay（视频/群聊通话早就走它）：内部按「是否已接通」
+    // 判定，状态切换不重建浮窗，并会把网页已通话秒数带给原生做基准。
+
+    // ── 自动搭话：心跳 ───────────────────────────────
+    //
+    // 每秒看一眼：通话处于 IDLE（谁也没在说）、没超上限、已过随机等待点，
+    // 就让角色主动开口。缩成小窗也照常触发——用户要的就是「挂着也一直聊」，
+    // 只是触发前会停掉在听的识别，免得把角色自己的声音录进去。
+    useEffect(() => {
+        autoChatConfigRef.current = autoChatConfig;
+        if (!autoChatConfig.enabled) {
+            autoChatDeadlineRef.current = 0;
+            return;
+        }
+        // 刚开启（或刚进通话）：从当下起算一个随机间隔
+        if (!autoChatDeadlineRef.current) {
+            autoChatDeadlineRef.current = Date.now() + randomAutoChatDelaySeconds(autoChatConfig) * 1000;
+        }
+        const timer = window.setInterval(() => {
+            if (stateRef.current !== "IDLE") return;
+            const limit = autoChatConfigRef.current.maxTurns;
+            if (limit > 0 && autoTurnsRef.current >= limit) return;
+            const deadline = autoChatDeadlineRef.current;
+            if (!deadline || Date.now() < deadline) return;
+            autoTurnsRef.current += 1;
+            autoChatDeadlineRef.current = 0;
+            if (sttRef.current) {
+                sttRef.current.abort();
+                sttRef.current = null;
+            }
+            continuousVoice.stop();
+            setInterimText("");
+            void runConversationTurn();
+        }, 1000);
+        return () => window.clearInterval(timer);
+    }, [autoChatConfig, runConversationTurn]);
 
     // ── Auto-listen: 进入 IDLE 自动开始监听 ────────
 
     const startListening = useCallback(() => {
-        if (holdToTalk) return; // 按住说话模式不用 Web Speech 自动监听
+        if (holdToTalk) return; // 免提连续监听模式不用 Web Speech 自动监听
         if (androidTextInputOnly) {
             setInputMode("text");
             return;
@@ -510,7 +724,7 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
         }
     }, [androidTextInputOnly, holdToTalk, runConversationTurn, session.contactId, showSttCompatibilityWarning]);
 
-    // IDLE 时自动开启监听（按住说话模式无自动监听，识别只在按住期间发生）
+    // IDLE 时自动开启监听（免提连续监听模式有自己的启停 effect，不走这里）
     useEffect(() => {
         if (holdToTalk) return;
         if (inputMode === "text" && sttRef.current) {
@@ -534,12 +748,61 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
         }
     }, [androidTextInputOnly, holdToTalk, callState, isMuted, inputMode, minimized, startListening]);
 
+    // 免提连续监听（非 iOS）：进了语音模式就一直听，开口自动录、停顿自动切段、
+    // 每段转写后直接发出去，用户不用按任何按钮，像真·电话一样。
+    const continuousVoice = useContinuousVoice({
+        characterId: session.contactId,
+        onSpeechStart: () => {
+            setInterimText("");
+            if (stateRef.current === "IDLE") setCallState("USER_SPEAKING");
+        },
+        onTranscribeStart: () => {
+            if (stateRef.current === "USER_SPEAKING") setCallState("PROCESSING");
+        },
+        onTranscript: (text) => { void runConversationTurn(text); },
+        onError: () => {
+            if (stateRef.current === "USER_SPEAKING" || stateRef.current === "PROCESSING") {
+                setCallState("IDLE");
+            }
+        },
+    });
+
+    // 连续监听的启停：
+    //   - 语音模式 + IDLE/USER_SPEAKING + 未静音 + 未缩小 → 启动
+    //   - 其余（文字模式 / PROCESSING / AI_SPEAKING / 静音 / 缩小 / 结束）→ 停止
+    // PROCESSING 与 AI_SPEAKING 期间必须停，否则会把角色 TTS 的声音录进去。
+    useEffect(() => {
+        if (!holdToTalk) return;
+        if (callState === "CONNECTING" || callState === "ENDED") {
+            continuousVoice.stop();
+            return;
+        }
+        if (inputMode !== "voice") {
+            continuousVoice.stop();
+            return;
+        }
+        if (minimized) {
+            continuousVoice.stop();
+            return;
+        }
+        if (callState === "IDLE" || callState === "USER_SPEAKING") {
+            continuousVoice.setMuted(isMuted);
+            continuousVoice.start();
+        } else {
+            // AI 思考/说话期间只静音，不释放麦克风：每轮 stop 再 start 会让安卓上
+            // 旧的音频设备来不及释放，紧接着的申请就报 NotReadableError，
+            // 表现就是「系统权限开着却打不开麦克风」。
+            continuousVoice.setMuted(true);
+        }
+    }, [holdToTalk, callState, inputMode, isMuted, minimized, continuousVoice.start, continuousVoice.stop, continuousVoice.setMuted]);
+
     const handleInputModeToggle = useCallback(() => {
         if (androidTextInputOnly) {
             if (sttRef.current) {
                 sttRef.current.abort();
                 sttRef.current = null;
             }
+            continuousVoice.stop();
             setInterimText("");
             if (stateRef.current === "USER_SPEAKING") setCallState("IDLE");
             setInputMode("text");
@@ -550,13 +813,14 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                 sttRef.current.abort();
                 sttRef.current = null;
             }
+            continuousVoice.stop();
             setInterimText("");
             if (stateRef.current === "USER_SPEAKING") setCallState("IDLE");
             setInputMode("text");
         } else {
             setInputMode("voice");
         }
-    }, [androidTextInputOnly, inputMode]);
+    }, [androidTextInputOnly, inputMode, continuousVoice.stop]);
 
     const handleTextSubmit = useCallback(() => {
         const text = typedText.trim();
@@ -579,28 +843,11 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
         runConversationTurn();
     }, [callState, runConversationTurn]);
 
-    // 按住说话（非 iOS）：按下录音，松开转写后走对话轮
-    const holdInput = useHoldToTalk({
-        characterId: session.contactId,
-        canStart: () => stateRef.current === "IDLE",
-        onRecordingStart: () => {
-            setInterimText("");
-            if (stateRef.current === "IDLE") setCallState("USER_SPEAKING");
-        },
-        onTranscribeStart: () => {
-            if (stateRef.current === "USER_SPEAKING") setCallState("PROCESSING");
-        },
-        onTranscript: (text) => { void runConversationTurn(text); },
-        onError: () => {
-            if (stateRef.current === "USER_SPEAKING" || stateRef.current === "PROCESSING") {
-                setCallState("IDLE");
-            }
-        },
-    });
-
     // ── Hangup ──────────────────────────────────────
 
     const handleHangup = useCallback(() => {
+        // 挂断时收掉原生浮窗（安卓壳里）
+        stopShellCallOverlay();
         setCallState("ENDED");
 
         // Stop any ongoing STT
@@ -608,6 +855,7 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
             sttRef.current.abort();
             sttRef.current = null;
         }
+        continuousVoice.stop();
 
         // Stop any ongoing audio playback
         if (audioAbortRef.current) {
@@ -632,21 +880,215 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
         setTimeout(() => onEnd(), 1500);
     }, [session.id, callDuration, onEnd]);
 
+    // 保持 ref 指向最新的 handleHangup（原生浮窗的挂断事件要调到它）
+    useEffect(() => { hangupRef.current = handleHangup; }, [handleHangup]);
+
+    // ── 待发送队列 ──
+    //
+    // 角色正在说话/思考时不能立刻发新消息（会打断当前一轮）。从前是「忙就丢掉」，
+    // 从浮窗回复条发消息时因此常常空发——字收了、条收了，消息却没了。
+    // 改为排队：空闲了自动补发。必须放在 runConversationTurn 之后。
+    const replyQueue = useCallReplyQueue({
+        callState,
+        callStateRef: stateRef,
+        runTurn: (text) => { void runConversationTurn(text); },
+        active: callState !== "CONNECTING" && callState !== "ENDED",
+    });
+
+    // ── 字幕操作：重听 / 编辑 / 删除 / 重新生成 ──────
+    //
+    // 四项都要落到真实聊天记录上（字幕带着 messageIds），不是只改屏幕上那行字：
+    // 只改屏幕会被下次重渲染覆盖，只改记录则通话页与聊天页对不上。
+
+    /**
+     * 清掉若干消息上的原音留档。
+     *
+     * 消息被编辑 / 删除 / 重新生成后，留档的音频与屏幕上的文字已经对不上，继续留着
+     * 只会让人点开听到另一句话。内存缓存原本就会 .delete，落库的引用同样要清。
+     */
+    const releaseAudioRefs = useCallback((messageIds: string[] | undefined) => {
+        for (const id of messageIds ?? []) {
+            const msg = messagesRef.current.find(item => item.id === id);
+            const ref = msg?.mediaData?.callAudioRef;
+            if (!ref) continue;
+            void releaseCallAudioRef(ref);
+            updateChatMessage(id, { mediaData: { ...msg.mediaData, callAudioRef: undefined } });
+        }
+    }, []);
+
+    /** 重听一句。优先放缓存，没有就现场合成；合成结果缓存起来，避免重复烧 TTS 额度。 */
+    const handleReplaySubtitle = useCallback(async (sub: SubtitleEntry) => {
+        const text = (sub.speechText || sub.text).trim();
+        if (!text) return;
+        // 先掐掉正在播的那句，否则两句叠在一起听不清
+        if (audioAbortRef.current) { audioAbortRef.current(); audioAbortRef.current = null; }
+        const cached = audioCacheRef.current.get(sub.id);
+        const voiceConfig = cached ? null : resolveVoiceConfig(session.contactId);
+        if (!cached && !voiceConfig) return;
+        setReplayingId(sub.id);
+        try {
+            let blob: Blob | null = cached ?? null;
+            if (!blob && voiceConfig) {
+                blob = await synthesizeSpeech(text, voiceConfig);
+                if (blob) cacheAudio(sub.id, blob);
+            }
+            if (!blob) return;
+            const { promise, abort } = playCallAudio(blob);
+            audioAbortRef.current = abort;
+            await promise;
+            audioAbortRef.current = null;
+        } catch (e) {
+            console.warn("[VoiceCall] replay failed:", e);
+        } finally {
+            setReplayingId((current) => (current === sub.id ? null : current));
+        }
+    }, [session.contactId, playCallAudio]);
+
+    /** 编辑一句：改写真实记录 + 同步字幕文本，并作废这句的音频缓存。 */
+    const handleEditSubtitle = useCallback((sub: SubtitleEntry, next: string) => {
+        releaseAudioRefs(sub.messageIds);
+        const ids = sub.messageIds ?? [];
+        if (ids.length > 0) updateChatMessage(ids[0], { content: next });
+        setSubtitles(prev => prev.map(item => item.id === sub.id
+            ? { ...item, text: next, speechText: item.role === "assistant" ? next : undefined }
+            : item));
+        audioCacheRef.current.delete(sub.id);
+        messagesRef.current = loadChatMessages(session.id);
+    }, [session.id]);
+
+    /** 删除一句：先删真实记录，再摘掉字幕。 */
+    const handleDeleteSubtitle = useCallback((sub: SubtitleEntry) => {
+        releaseAudioRefs(sub.messageIds);
+        for (const id of sub.messageIds ?? []) deleteChatMessage(id);
+        setSubtitles(prev => prev.filter(item => item.id !== sub.id));
+        audioCacheRef.current.delete(sub.id);
+        messagesRef.current = loadChatMessages(session.id);
+    }, [session.id]);
+
+    /**
+     * 重新生成一句：删掉这句对应的记录，再让角色基于当前上下文重说一轮。
+     *
+     * 只在空闲时可用——正在生成或说话时重开会打断在途的一轮，状态机会乱。
+     * 界面侧也只对「最后一条角色字幕」开放：它要删掉这句之后的记录，
+     * 对中间句开放会把用户后面说的话一起级联删掉。
+     */
+    const handleRegenerateSubtitle = useCallback((sub: SubtitleEntry) => {
+        if (stateRef.current !== "IDLE") return;
+        releaseAudioRefs(sub.messageIds);
+        for (const id of sub.messageIds ?? []) deleteChatMessage(id);
+        setSubtitles(prev => prev.filter(item => item.id !== sub.id));
+        audioCacheRef.current.delete(sub.id);
+        // 先同步内存上下文再重开，否则角色会看见刚被删掉的那句
+        messagesRef.current = loadChatMessages(session.id);
+        void runConversationTurn();
+    }, [session.id, runConversationTurn]);
+
+    // ── 接入原生浮窗 ──
+    //
+    // 必须放在 handleHangup / runConversationTurn 定义之后：下面这个钩子的
+    // 参数直接引用它们，位置提前会撞上 const 的暂时性死区，渲染即抛错。
+    const shellOverlay = useShellCallOverlay({
+        active: callState !== "CONNECTING" && callState !== "ENDED",
+        label: "语音通话",
+        name: character.name,
+        avatar: bgImageResolved || character.avatar || null,
+        // 墙钟推算而不是直接读 callDurationRef：页面在后台被系统冻结时，
+        // 那个 state 的镜像会停在旧值，回灌给原生反而把浮窗时长往回拽。
+        getDuration: () => Math.max(
+            callDurationRef.current,
+            callStartRef.current ? Math.floor((Date.now() - callStartRef.current) / 1000) : 0,
+        ),
+        // 浮窗里发来的消息一律进队列：忙时排队、空闲时自动补发，不再静默丢弃
+        onReply: (text) => { replyQueue.submit(text); },
+        onHangup: () => hangupRef.current(),
+        onRestore,
+        onTick: (seconds) => {
+            // 原生计时校准：只前进、不后退。
+            // 网页在后台被冻结时计时会落后，以原生为准把基准推上去；
+            // 反过来（原生更小）一律忽略，否则时长来回跳，
+            // 挂断时写进聊天记录的时长也跟着乱。
+            if (seconds > callDurationRef.current) {
+                callStartRef.current = Date.now() - seconds * 1000;
+                callDurationRef.current = seconds;
+                setCallDuration(seconds);
+            }
+        },
+        // 待发条数同步给原生浮窗角标：切到别的 App 后队列看不见，
+        // 这是唯一能告诉用户「话还排着、没丢」的地方。
+        pendingCount: replyQueue.pending,
+    });
+
+    // 浮窗权限未开时的引导条（钩子里给标记，这里管自动消失）
+    useEffect(() => {
+        if (!shellOverlay.showPermissionHint) return;
+        const done = () => shellOverlay.dismissPermissionHint();
+        const timer = window.setTimeout(done, 12000);
+        return () => window.clearTimeout(timer);
+    }, [shellOverlay.showPermissionHint]);
+
+    // ── 自动搭话按钮的拖动（指针事件；拖过就不触发开关） ──
+    const handleAutoChatPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        // 点在展开的面板内部（勾选框、数字框）时不拖动
+        if ((event.target as HTMLElement).closest("[data-auto-chat-panel]")) return;
+        const box = autoChatBoxRef.current;
+        if (!box) return;
+        const rect = box.getBoundingClientRect();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        autoChatDragRef.current = {
+            id: event.pointerId,
+            sx: event.clientX,
+            sy: event.clientY,
+            ox: rect.left,
+            oy: rect.top,
+            moved: false,
+        };
+    }, []);
+
+    const handleAutoChatPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const drag = autoChatDragRef.current;
+        if (!drag || drag.id !== event.pointerId) return;
+        const dx = event.clientX - drag.sx;
+        const dy = event.clientY - drag.sy;
+        if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+        if (!drag.moved) return;
+        const width = autoChatBoxRef.current?.offsetWidth ?? 120;
+        const maxX = Math.max(0, window.innerWidth - width);
+        setAutoChatPos({
+            x: Math.min(Math.max(0, drag.ox + dx), maxX),
+            y: Math.max(0, drag.oy + dy),
+        });
+    }, []);
+
+    const handleAutoChatPointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        const drag = autoChatDragRef.current;
+        if (!drag || drag.id !== event.pointerId) return;
+        autoChatDragRef.current = null;
+        if (!drag.moved) {
+            // 没移动 = 轻点：开合面板
+            setShowAutoChatPanel(v => !v);
+            return;
+        }
+        try {
+            window.localStorage.setItem(AUTO_CHAT_POS_KEY, JSON.stringify(autoChatPos));
+        } catch {
+            /* 存不下就算了，不影响这次拖动 */
+        }
+    }, [autoChatPos]);
+
     // ── Render ──────────────────────────────────────
 
     if (minimized) {
         return (
-            <button
-                type="button"
-                className="call-mini-window"
-                style={{ backgroundImage: `url(${bgImageResolved || resolveChatCharacterAvatar(character)})` }}
-                onClick={onRestore}
-                aria-label={`返回与${character.name}的语音通话`}
-                title="点击返回通话"
-            >
-                <span className="call-mini-window-overlay" />
-                <span className="call-mini-window-name">{character.name}</span>
-            </button>
+            <CallMiniWindow
+                imageUrl={bgImageResolved || character.avatar || null}
+                title={character.name}
+                meta={[callState === "ENDED" ? "通话已结束" : "语音通话", formatTime(callDuration)]}
+                ariaLabel={`返回与${character.name}的语音通话`}
+                onRestore={onRestore}
+                // 长按小窗就地回复，不必先跳回通话界面
+                onReply={(text) => replyQueue.submit(text) !== "rejected"}
+                pendingCount={replyQueue.pending}
+            />
         );
     }
 
@@ -663,6 +1105,37 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
 
             <CallVolumeControl />
 
+            {/* 待发送提示：缩成小窗/全屏都看得见，避免以为消息丢了 */}
+            {replyQueue.pending > 0 && (
+                <div
+                    style={{
+                        position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)",
+                        zIndex: 45, padding: "4px 12px", borderRadius: 999,
+                        background: "rgba(20,20,26,0.8)", backdropFilter: "blur(8px)",
+                        fontSize: 11.5, color: "#fff", whiteSpace: "nowrap",
+                    }}
+                >
+                    对方说完就发 · 还有 {replyQueue.pending} 条
+                </div>
+            )}
+
+            {/* 浮窗权限未开：切出去时给一条引导（只在壳里、且确实触发过时出现） */}
+            {shellOverlay.showPermissionHint && isShellEnvironment() && (
+                <div
+                    role="button"
+                    onClick={() => { shellOverlay.requestPermission(); shellOverlay.dismissPermissionHint(); }}
+                    style={{
+                        position: "absolute", top: 100, left: 12, right: 12, zIndex: 40,
+                        padding: "9px 12px", borderRadius: 12,
+                        background: "rgba(20,20,26,0.88)", backdropFilter: "blur(10px)",
+                        color: "#fff", fontSize: 12, lineHeight: 1.5, cursor: "pointer",
+                        boxShadow: "0 6px 20px rgba(0,0,0,0.35)",
+                    }}
+                >
+                    切到其他 App 时会挂一个通话浮窗。首次使用需开启「显示在其他应用上层」权限，点这里去开。
+                </div>
+            )}
+
             {onMinimize && callState !== "ENDED" && (
                 <button
                     type="button"
@@ -675,6 +1148,159 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                         <path d="M15 18l-6-6 6-6" />
                     </svg>
                 </button>
+            )}
+
+            {/* 自动搭话：我不出声时让角色主动找话说（煲电话粥用） */}
+            {callState !== "CONNECTING" && callState !== "ENDED" && (
+                <div
+                    ref={autoChatBoxRef}
+                    style={{
+                        ...AUTO_CHAT_BOX_BASE,
+                        // 面板展开时铺满可视区域（留 8px 边），不跟随按钮拖拽位置：
+                        // 按钮被拖到边缘后展开的面板会跑出屏幕，参数就改不了了。
+                        ...(showAutoChatPanel
+                            ? {
+                                top: 8, left: 8, right: 8, bottom: 8,
+                                pointerEvents: "none" as const,
+                            }
+                            : {
+                                top: autoChatPos.y,
+                                ...(autoChatPos.x == null ? { right: 12 } : { left: autoChatPos.x }),
+                            }),
+                    }}
+                    onPointerDown={handleAutoChatPointerDown}
+                    onPointerMove={handleAutoChatPointerMove}
+                    onPointerUp={handleAutoChatPointerUp}
+                    onPointerCancel={handleAutoChatPointerUp}
+                >
+                    <button
+                        type="button"
+                        aria-label="自动搭话设置"
+                        title={
+                            autoChatConfig.enabled
+                                ? `自动搭话：静默 ${autoChatConfig.minSeconds}~${autoChatConfig.maxSeconds} 秒随机开口`
+                                : "自动搭话：已关闭"
+                        }
+                        style={{
+                            display: "flex", alignItems: "center", gap: 5,
+                            padding: "6px 10px", borderRadius: 999, border: "none",
+                            background: autoChatConfig.enabled ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.18)",
+                            color: autoChatConfig.enabled ? "#1b1b22" : "#fff",
+                            fontSize: 12, fontWeight: 600, cursor: "pointer",
+                            backdropFilter: "blur(8px)",
+                            pointerEvents: "auto",
+                        }}
+                    >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+                        </svg>
+                        {autoChatConfig.enabled
+                            ? `自动搭话 ${autoChatConfig.minSeconds}~${autoChatConfig.maxSeconds}s`
+                            : "自动搭话 关"}
+                    </button>
+
+                    {showAutoChatPanel && (
+                        <div
+                            data-auto-chat-panel=""
+                            style={{
+                                display: "flex", flexDirection: "column", gap: 9,
+                                padding: "12px 13px", borderRadius: 14,
+                                background: "rgba(20,20,26,0.94)", backdropFilter: "blur(10px)",
+                                color: "#fff", fontSize: 12,
+                                width: "100%", maxWidth: 440,
+                                flex: "1 1 auto", minHeight: 0, maxHeight: "100%",
+                                overflowY: "auto",
+                                WebkitOverflowScrolling: "touch", overscrollBehavior: "contain",
+                                boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+                                pointerEvents: "auto",
+                            }}
+                        >
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                                <span style={{ fontWeight: 700, fontSize: 13 }}>自动搭话设置</span>
+                                <button
+                                    type="button"
+                                    aria-label="关闭设置"
+                                    onClick={() => setShowAutoChatPanel(false)}
+                                    style={{
+                                        width: 26, height: 26, borderRadius: 13, border: "none",
+                                        background: "rgba(255,255,255,0.14)", color: "#fff",
+                                        fontSize: 15, lineHeight: "26px", cursor: "pointer",
+                                    }}
+                                >×</button>
+                            </div>
+                            <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                                <span style={{ fontWeight: 600 }}>自动搭话</span>
+                                <input
+                                    type="checkbox"
+                                    checked={autoChatConfig.enabled}
+                                    onChange={(e) => {
+                                        const next = saveCallAutoChatConfig({ ...autoChatConfig, enabled: e.target.checked });
+                                        setAutoChatConfig(next);
+                                        autoTurnsRef.current = 0;
+                                        emptyAutoTurnsRef.current = 0;
+                                        autoChatDeadlineRef.current = 0;
+                                    }}
+                                    style={{ width: 18, height: 18, accentColor: "#fff" }}
+                                />
+                            </label>
+
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                                <span>静默下限</span>
+                                <input
+                                    type="number"
+                                    min={MIN_INTERVAL_SECONDS}
+                                    defaultValue={autoChatConfig.minSeconds}
+                                    title={`最小 ${MIN_INTERVAL_SECONDS} 秒`}
+                                    onBlur={(e) => {
+                                        const next = saveCallAutoChatConfig({ ...autoChatConfig, minSeconds: Number(e.target.value) });
+                                        setAutoChatConfig(next);
+                                        e.target.value = String(next.minSeconds);
+                                        autoChatDeadlineRef.current = 0;
+                                    }}
+                                    style={AUTO_CHAT_INPUT_STYLE}
+                                />
+                            </div>
+
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                                <span>静默上限</span>
+                                <input
+                                    type="number"
+                                    min={autoChatConfig.minSeconds}
+                                    defaultValue={autoChatConfig.maxSeconds}
+                                    title="不小于静默下限"
+                                    onBlur={(e) => {
+                                        const next = saveCallAutoChatConfig({ ...autoChatConfig, maxSeconds: Number(e.target.value) });
+                                        setAutoChatConfig(next);
+                                        e.target.value = String(next.maxSeconds);
+                                        autoChatDeadlineRef.current = 0;
+                                    }}
+                                    style={AUTO_CHAT_INPUT_STYLE}
+                                />
+                            </div>
+
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                                <span>条数上限</span>
+                                <input
+                                    type="number"
+                                    min={0}
+                                    max={MAX_TURNS_LIMIT}
+                                    defaultValue={autoChatConfig.maxTurns}
+                                    title="0 = 不限"
+                                    onBlur={(e) => {
+                                        const next = saveCallAutoChatConfig({ ...autoChatConfig, maxTurns: Number(e.target.value) });
+                                        setAutoChatConfig(next);
+                                        e.target.value = String(next.maxTurns);
+                                    }}
+                                    style={AUTO_CHAT_INPUT_STYLE}
+                                />
+                            </div>
+
+                            <div style={{ opacity: 0.62, lineHeight: 1.5 }}>
+                                静默时长在上下限之间随机取值；条数上限填 0 = 不限。你开口后重新计数。
+                            </div>
+                        </div>
+                    )}
+                </div>
             )}
 
             {/* Content wrapper — force white text so themes don't override call UI */}
@@ -743,15 +1369,53 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                     className="voicecall-subtitle-mask flex-1 min-h-0 overflow-auto px-5 py-[10px] flex flex-col gap-2 relative"
                     {...(inputMode === "text" && callState !== "CONNECTING" && callState !== "ENDED" ? { "data-text-input": "" } : {})}
                 >
-                    {subtitles.map((sub) => (
+                    {/* 排队中的消息：角色说完这轮就会自动发出去，让用户知道没丢 */}
+                    {replyQueue.pending > 0 && (
                         <div
-                            key={sub.id}
-                            className="call-subtitle"
-                            data-role={sub.role}
+                            style={{
+                                alignSelf: "center", flexShrink: 0,
+                                padding: "4px 12px", borderRadius: 999,
+                                background: "rgba(255,255,255,0.16)", backdropFilter: "blur(8px)",
+                                fontSize: 11.5, color: "rgba(255,255,255,0.92)",
+                            }}
                         >
-                            <BilingualTextBlock text={sub.text} mode="plain" className="call-subtitle-bilingual" defaultExpanded={session.collapseBilingualTranslation !== false ? false : true} />
+                            对方说完就发 · 还有 {replyQueue.pending} 条
                         </div>
-                    ))}
+                    )}
+                    {subtitles.map((sub, index) => {
+                        const isAssistant = sub.role === "assistant";
+                        // 「重新生成」只给最后一条角色字幕：它要删掉这句及之后的记录重说，
+                        // 对中间句开放会把用户后面说的话一起级联删掉。
+                        const isLastAssistant = isAssistant
+                            && !subtitles.slice(index + 1).some(item => item.role === "assistant");
+                        const actions: CallSubtitleAction[] = [];
+                        if (isLastAssistant) {
+                            actions.push({
+                                key: "regenerate",
+                                label: "重新生成这一句",
+                                onSelect: () => handleRegenerateSubtitle(sub),
+                            });
+                        }
+                        actions.push({
+                            key: "delete",
+                            label: "删除这一句",
+                            danger: true,
+                            onSelect: () => handleDeleteSubtitle(sub),
+                        });
+                        return (
+                            <CallSubtitleItem
+                                key={sub.id}
+                                role={sub.role}
+                                text={sub.text}
+                                bilingualClassName="call-subtitle-bilingual"
+                                defaultExpanded={session.collapseBilingualTranslation !== false ? false : true}
+                                onReplay={isAssistant ? () => { void handleReplaySubtitle(sub); } : undefined}
+                                replaying={replayingId === sub.id}
+                                actions={actions}
+                                onEditSubmit={(next) => handleEditSubtitle(sub, next)}
+                            />
+                        );
+                    })}
 
                     {/* Interim STT text */}
                     {interimText && callState === "USER_SPEAKING" && (
@@ -806,12 +1470,32 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                     </form>
                 )}
 
-                {/* 按住说话提示/错误行 */}
+                {/* 免提提示行：连续监听模式下告诉用户可以直接说话 */}
                 {holdToTalk && inputMode === "voice" && callState !== "CONNECTING" && callState !== "ENDED" && (
                     <div className="text-center ts-12 opacity-80 px-5">
-                        {holdInput.recState === "recording" ? "松开发送"
-                            : holdInput.recState === "transcribing" ? "识别中…"
-                            : holdInput.error || "按住下方麦克风说话"}
+                        <div>
+                            {continuousVoice.state === "transcribing" ? "识别中…"
+                                : continuousVoice.state === "speaking" ? "正在聆听…"
+                                : continuousVoice.error || "直接说话即可，无需按住"}
+                        </div>
+                        {/* 收音电平：手机上没法看控制台，这几格能直接看出麦克风有没有在收音 */}
+                        {!continuousVoice.error && (
+                            <div className="flex items-center justify-center gap-[3px] mt-1" aria-hidden="true">
+                                {[0.02, 0.05, 0.09, 0.16, 0.28].map((threshold, index) => (
+                                    <span
+                                        key={threshold}
+                                        style={{
+                                            width: 4,
+                                            height: 6 + index * 3,
+                                            borderRadius: 2,
+                                            background: continuousVoice.level >= threshold
+                                                ? "currentColor"
+                                                : "rgba(255,255,255,0.2)",
+                                        }}
+                                    />
+                                ))}
+                            </div>
+                        )}
                     </div>
                 )}
 
@@ -820,63 +1504,7 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                     className="flex justify-center items-center gap-[40px] p-5"
                     style={{ paddingBottom: "max(30px, env(safe-area-inset-bottom))" }}
                 >
-                    {callState !== "ENDED" && callState !== "CONNECTING" ? holdToTalk ? (
-                        <>
-                            {/* 输入方式切换（按住说话模式不需要持续开麦，静音位改放 Aa 切换） */}
-                            <button
-                                onClick={handleInputModeToggle}
-                                className="ui-call-btn ui-call-btn-muted"
-                                aria-label={inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
-                            >
-                                {inputMode === "voice" ? (
-                                    <span className="ui-call-input-text-icon">Aa</span>
-                                ) : (
-                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                                        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                                        <line x1="12" y1="19" x2="12" y2="22" />
-                                    </svg>
-                                )}
-                            </button>
-
-                            {/* 按住说话主按钮（文字模式下点按切回语音） */}
-                            <button
-                                className="ui-call-mic ui-call-mic-lg"
-                                style={{ touchAction: "none" }}
-                                data-state={
-                                    inputMode === "text" ? "text"
-                                        : holdInput.recState === "recording" ? "speaking"
-                                        : callState === "IDLE" ? "idle"
-                                        : "busy"
-                                }
-                                aria-label={inputMode === "text" ? "切换到语音输入" : "按住说话"}
-                                title={inputMode === "text" ? "切换到语音输入" : "按住说话"}
-                                {...(inputMode === "voice" ? holdInput.pressHandlers : { onClick: handleInputModeToggle })}
-                            >
-                                {inputMode === "text" ? (
-                                    <span className="ui-call-input-text-icon">Aa</span>
-                                ) : (
-                                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                                        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                                        <line x1="12" y1="19" x2="12" y2="22" />
-                                    </svg>
-                                )}
-                            </button>
-
-                            {/* Hangup */}
-                            <button
-                                onClick={handleHangup}
-                                className="ui-call-btn ui-call-btn-danger"
-                                aria-label="挂断"
-                            >
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                    <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91" />
-                                    <line x1="23" y1="1" x2="1" y2="23" />
-                                </svg>
-                            </button>
-                        </>
-                    ) : androidTextInputOnly ? (
+                    {callState !== "ENDED" && callState !== "CONNECTING" ? androidTextInputOnly ? (
                         <button
                             onClick={handleHangup}
                             className="ui-call-btn ui-call-btn-danger"
@@ -889,9 +1517,13 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                         </button>
                     ) : (
                         <>
-                            {/* Mute button */}
+                            {/* Mute button — 免提模式下即时静音连续监听 */}
                             <button
-                                onClick={() => setIsMuted(!isMuted)}
+                                onClick={() => {
+                                    const next = !isMuted;
+                                    setIsMuted(next);
+                                    if (holdToTalk) continuousVoice.setMuted(next);
+                                }}
                                 className="ui-call-btn ui-call-btn-muted"
                                 {...(isMuted ? { "data-checked": "" } : {})}
                             >
@@ -923,8 +1555,8 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                                         : callState === "IDLE" ? (isMuted ? "idle-muted" : "idle")
                                         : "busy"
                                 }
-                                aria-label={androidTextInputOnly ? "文字输入" : inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
-                                title={androidTextInputOnly ? "安卓浏览器使用文字输入" : inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
+                                aria-label={inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
+                                title={inputMode === "voice" ? "切换到文字输入" : "切换到语音输入"}
                             >
                                 {inputMode === "text" ? (
                                     <span className="ui-call-input-text-icon">Aa</span>

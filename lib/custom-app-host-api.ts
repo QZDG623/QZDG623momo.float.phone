@@ -496,6 +496,7 @@ function serializeChatMessage(message: ChatMessage): Record<string, unknown> {
     senderName: message.senderName,
     mediaType: message.mediaType,
     mediaData: asRecord(message.mediaData),
+    origin: message.origin,
     isRetracted: message.isRetracted === true,
   };
 }

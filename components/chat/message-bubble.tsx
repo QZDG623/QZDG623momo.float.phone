@@ -12,7 +12,8 @@ import { ContactCardGenerateFlow } from "@/components/chat/contact-card-generate
 import { MediaPreviewOverlay } from "@/components/chat/media-preview-overlay";
 import { findStickerByName } from "@/lib/sticker-data";
 import { splitBilingualText } from "@/lib/bilingual-text";
-import { isInvisibleOrWhitespaceOnly } from "@/lib/rich-message-parser";
+import { isInvisibleOrWhitespaceOnly, stripPerformanceShells } from "@/lib/rich-message-parser";
+import { sanitizeSpeechText, toMinimaxSpeakText } from "@/lib/tts-service";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
@@ -132,7 +133,7 @@ export const MessageBubble = memo(function MessageBubble({ msg, onUpdate, charNa
             if (msg.mediaType?.startsWith("plugin:")) {
                 return <PluginKindBubble msg={msg} kind={msg.mediaType.slice("plugin:".length)} />;
             }
-            const textBubble = <TextBubble content={displayContent ?? msg.content} onActionSelect={onActionSelect} defaultTranslationExpanded={defaultTranslationExpanded} />;
+            const textBubble = <TextBubble content={displayContent ?? msg.content} stripPerformance={msg.role !== "user"} onActionSelect={onActionSelect} defaultTranslationExpanded={defaultTranslationExpanded} />;
             return (
                 <>
                     {textBubble}
@@ -259,8 +260,16 @@ function splitChatContent(text: string): { type: "md" | "html"; content: string 
     return segments;
 }
 
+// 只有看起来像表演指令的正文才走剥壳流程：避免把用户随手打的 [1]、（注）清掉。
+const PERFORMANCE_HINT_RE = /<[a-zA-Z][^>]*>|\((?:laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasp|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)|【[^】]*】|（[^）]*）/i;
+
 export function normalizeTextBubbleContent(content: string): string {
-    const cleaned = content
+    // 表演指令（灰色旁白 HTML 块、(breath) 等 Sound Tag）不该出现在气泡里。
+    // 这里是最外层渲染入口，所以历史里已经存下的旧消息也一并被清掉。
+    // 旁白 HTML 有时是转义过的（`&lt;span style=…&gt;`），判特征前先还原，否则会漏判。
+    const hintSource = content.replace(/&lt;/gi, "<").replace(/&gt;/gi, ">");
+    const base = PERFORMANCE_HINT_RE.test(hintSource) ? stripPerformanceShells(content) : content;
+    const cleaned = base
         .replace(/\[音乐(?:分享)?(?:[：:][^\]]*)?\]/g, "")
         .replace(/\[[^\]]+拍了拍[^\]]+\]/g, "")
         .replace(/\[[^\]]*?(?:获取指令|获取工具)[:：][^\]]*\]/g, "")
@@ -709,8 +718,13 @@ export const BilingualTextBlock = memo(function BilingualTextBlock({
     );
 });
 
-function TextBubble({ content, onActionSelect, defaultTranslationExpanded = false }: { content: string; onActionSelect?: (text: string) => void; defaultTranslationExpanded?: boolean }) {
-    return <BilingualTextBlock text={content} onActionSelect={onActionSelect} mode="markdown" defaultExpanded={defaultTranslationExpanded} />;
+function TextBubble({ content, onActionSelect, defaultTranslationExpanded = false, stripPerformance = true }: { content: string; onActionSelect?: (text: string) => void; defaultTranslationExpanded?: boolean; stripPerformance?: boolean }) {
+    // 双保险：调用方可能直接传原始正文（线下模式、群聊动作消息等），这里再清一遍，
+    // 保证灰色旁白 HTML 与 (breath) 这类 Sound Tag 永远不会出现在气泡里。
+    // 用户自己打的字不清洗——那是他的原话，括号也可能是正常内容。
+    const cleaned = stripPerformance ? normalizeTextBubbleContent(content) : content;
+    if (!cleaned) return null;
+    return <BilingualTextBlock text={cleaned} onActionSelect={onActionSelect} mode="markdown" defaultExpanded={defaultTranslationExpanded} />;
 }
 
 // ── Red Packet ─────────────────────────────
@@ -2402,12 +2416,31 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const mountedRef = useRef(true);
     useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
-    const text = msg.mediaData?.label || "语音消息";
-    const bilingual = splitBilingualText(text);
-    const speechText = bilingual?.original || text;
+    // label 就是这条语音被念出来的文本。历史版本把旁白 HTML（连 style 里的整串 CSS）
+    // 一起存进了 label，于是"很短一句话却有 45 秒"而且念的全不是台词。这里先按 TTS
+    // 的同一套规则清洗，既用于重合成判定，也用于时长估算——存过脏 label 的旧语音会
+    // 因此判定为"待重合成"，点一下就用干净台词重录。
+    const rawLabel = msg.mediaData?.label || "语音消息";
+    const bilingual = splitBilingualText(rawLabel);
+    // 双语消息只念原文那半，译文本来就不该被读出来；清洗放在切分之后，
+    // 免得 dropLatin 先把英文原文抹掉、把 "原文|译文" 的结构弄坏。
+    // 用 toMinimaxSpeakText 而不是裸的 sanitizeSpeechText：拿到的是"真正被念出来的
+    // 那一串文本"（标签已转成 <#x#> 停顿、残留英文已抹掉），存进 synthesizedFromText
+    // 后与旧录音比对不一致，旧语音条（当年把 (breath) 念成"breath"音的那批）会自动
+    // 判定为待重合成，点一下就用干净台词重录。
+    const text = toMinimaxSpeakText(bilingual?.original || rawLabel);
+    const speechText = text;
     const synthesizedFromText = msg.mediaData?.synthesizedFromText;
     const needsResynthesis = msg.role !== "user" && synthesizedFromText !== speechText;
-    const duration = msg.mediaData?.voiceDuration || Math.max(2, Math.ceil(speechText.length / 4));
+    // 时长只按"真正会被念出来的字"估算：Sound Tag / 停顿标记不占播放时间。
+    const estimatedDuration = Math.max(2, Math.ceil(speechText
+        .replace(/<\s*#[0-9.]+\s*#\s*>/g, "")
+        .replace(/\((?:breath|sighs|sniffs|gasp|exhale|inhale|pant|chuckle|laughs|lip-smacking|emm|pant|groans|snorts|coughs|clear-throat|hissing|humming|burps|sneezes)\)/gi, "")
+        .length / 4));
+    // 旧语音条的 voiceDuration 是按脏 label（含整串 CSS 旁白）算出来的——"很短一句话
+    // 却显示 45 秒"就是它。只要这条语音待重合成，就不再拿旧时长误导用户。
+    const storedDuration = typeof msg.mediaData?.voiceDuration === "number" ? msg.mediaData.voiceDuration : 0;
+    const duration = needsResynthesis || !storedDuration ? estimatedDuration : storedDuration;
 
     const playSrc = (src: string) => {
         // 必须用 <audio> 元素:iOS 静音拨键会掐掉 Web Audio 的输出(表现为全线
@@ -2445,11 +2478,17 @@ function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpa
             if (msg.mediaUrl) playSrc(msg.mediaUrl);
             return;
         }
+        // 整条消息只有表演标记、没有可念的台词时，别去合成一段没人话的音频——
+        // 有历史录音就照播，没有就算了。
+        if (!speechText) {
+            if (msg.mediaUrl) playSrc(msg.mediaUrl);
+            return;
+        }
         setSynthesizing(true);
         setSynthError(null);
         synthesizeVoiceForMessage(msg.id, characterId, speechText)
             .then((dataUrl) => {
-                if (onUpdate) onUpdate({ ...msg, mediaUrl: dataUrl, mediaData: { ...msg.mediaData, synthesizedFromText: speechText } });
+                if (onUpdate) onUpdate({ ...msg, mediaUrl: dataUrl, mediaData: { ...msg.mediaData, synthesizedFromText: speechText, voiceDuration: estimatedDuration } });
                 if (!mountedRef.current) return;
                 setSynthesizing(false);
                 playSrc(dataUrl);

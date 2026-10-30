@@ -175,6 +175,9 @@ export type VoiceApiConfig = {
     region?: string;
     model?: string;
     sttModel?: string;
+    /** 识别改用其它语音方案（其 apiKey/baseUrl/sttModel），本方案只负责说话。
+     *  典型场景：Fish Audio 合成便宜，但识别额度为 0，借 MiniMax/OpenAI 转写。 */
+    sttConfigId?: string;
     defaultVoice: string;
     languageBoost?: string;
     /** Minimax voice_setting.speed. Missing values keep the legacy 1.0x behavior. */

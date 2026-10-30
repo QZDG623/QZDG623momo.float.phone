@@ -8,7 +8,7 @@ import { stripHallucinatedTimestamps } from "./llm-provider-adapter";
 import { MacroEngine } from "./macro-engine";
 import { getActiveAppTags } from "./content-tag-utils";
 import { loadChatMessages, loadChatSessions, reindexSessionMessageOrdersByTime } from "./chat-storage";
-import { hasAccountPushSubscription } from "./push-client";
+import { hasAccountPushSubscription, isShellEnvironment } from "./push-client";
 import { isPersonalPushCloudActive, loadPersonalPushCloudState, personalPushFetch } from "./personal-push-cloud";
 import { removeTimedWakeSchedule } from "./timed-wake-storage";
 import { appendBridgeFeed } from "./reality-bridge/storage";
@@ -57,8 +57,12 @@ function clearTimedWakeIfHandled(triggerKey: string | null): void {
 
 export async function consumeServerOutbox(options?: { silent?: boolean; force?: boolean }): Promise<void> {
     if (typeof window === "undefined") return;
+    // 壳环境的任务与回传箱都走站点（账号 id 与壳订阅一致，见 pushJobsFetch）：
+    // 服务端生成的消息落在站点库里，user_id = 站点账号 id。个人云那条路在壳里
+    // 是断的（网关按 OWNER_ID 存取），所以壳必须读站点回传箱，不能读个人云。
+    const shellMode = isShellEnvironment();
     // 共享回传箱已紧急停用：没有个人 Supabase 时直接结束，不请求 status/outbox。
-    if (!isPersonalPushCloudActive()) return;
+    if (!shellMode && !isPersonalPushCloudActive()) return;
     if (consuming) return;
     if (options?.force !== true && Date.now() - lastConsumeAt < OUTBOX_FOREGROUND_CHECK_INTERVAL_MS) return;
     // 没有任何设备订阅推送时，服务端不可能产生普通离线回传；避免所有在线用户空轮询。
@@ -67,8 +71,8 @@ export async function consumeServerOutbox(options?: { silent?: boolean; force?: 
     lastConsumeAt = Date.now();
     const passStartMs = Date.now();
     try {
-        // 共享回传箱已停用，只读取用户自己的 Supabase。
-        const sources: Array<"personal" | "shared"> = ["personal"];
+        // 壳读站点回传箱（与它的任务同源）；其余情况读个人云回传箱。
+        const sources: Array<"personal" | "shared"> = shellMode ? ["shared"] : ["personal"];
         const handledTriggerKeys = new Set<string>();
         for (const source of sources) {
           for (let batch = 0; batch < MAX_OUTBOX_BATCHES_PER_PASS; batch += 1) {
@@ -273,8 +277,6 @@ export function installServerOutboxConsumer(): void {
     if (typeof window === "undefined" || consumerInstalled) return;
     consumerInstalled = true;
 
-    // 启动时保留 5 分钟节流；回前台和 SW 明确告知新消息时强制补拉。
-    // iOS 会在后台冻结页面，如果回前台仍被节流，屏幕速聊消息只能等到下次重启才会合并。
     const requestConsume = (force = false) => {
         if (consumeRequestTimer !== null) window.clearTimeout(consumeRequestTimer);
         consumeRequestTimer = window.setTimeout(() => {
@@ -283,7 +285,13 @@ export function installServerOutboxConsumer(): void {
         }, 150);
     };
 
-    requestConsume(false);
+    // 每次冷启动都强制拉一次（force=true 会绕过 consumeServerOutbox 内的 5 分钟节流）。
+    //
+    // 之前这里是非强制：用户若在 5 分钟内重开 App，启动拉取被节流跳过，聊天里就看不到
+    // 服务端已经生成、通知也已经弹过的那条消息——「弹窗比聊天里的消息慢」正是这么来的。
+    // 主动消息本来就该「打开 App 即见」，不该依赖用户去点那条通知，也不该被节流挡下。
+    // 代价仅是多一次 outbox 查询；服务端返回空列表时客户端立刻结束。
+    requestConsume(true);
     document.addEventListener("visibilitychange", () => {
         if (!document.hidden) requestConsume(true);
     });

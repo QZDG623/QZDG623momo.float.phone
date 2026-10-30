@@ -20,7 +20,7 @@ import {
 import type { ChatMessage, StateValue } from "./chat-storage";
 import { generateChatCompletion, flattenCompletionResult } from "./chat-engine";
 import { armFollowUpBailout, armIdleReconnectBailout, cancelBailoutKey, cancelBailoutPrefix, cancelFollowUpBailout, startBailoutHeartbeat } from "./push-bailout-client";
-import { isWithinPushQuietHours } from "./push-client";
+import { hasAccountPushSubscription, isWithinPushQuietHours } from "./push-client";
 import {
     IDLE_RECONNECT_MAX_CONSECUTIVE,
     loadIdleReconnectRules,
@@ -35,7 +35,7 @@ import type { ParsedMessagePart } from "./rich-message-parser";
 import { getStatusRegionConfig, isCustomStatusRegionActive } from "./chat-status-region";
 import { isKnownStickerLabel } from "./sticker-data";
 import { loadCharacters } from "./character-storage";
-import { bgSetInterval, bgSetTimeout } from "./bg-timer";
+import { bgDelay, bgSetInterval, bgSetTimeout } from "./bg-timer";
 import { dispatchChatMessageNotice } from "./chat-notification-events";
 import { settleShoppingPaymentRequest } from "./shopping-payment-request";
 import {
@@ -232,7 +232,10 @@ export function scheduleFollowUp(sessionId: string, count: number, stateValues?:
     void armFollowUpBailout(sessionId, count, delaySec, fireAt);
 }
 
-export async function requestBackgroundChatReply(sessionId: string): Promise<{ ok: boolean; skipped?: string }> {
+export async function requestBackgroundChatReply(
+    sessionId: string,
+    options?: { ephemeralSystemNote?: string },
+): Promise<{ ok: boolean; skipped?: string }> {
     if (backgroundReplyFiringSet.has(sessionId)) return { ok: false, skipped: "already_running" };
     const session = loadChatSessions().find(s => s.id === sessionId);
     if (!session) return { ok: false, skipped: "missing_session" };
@@ -247,7 +250,11 @@ export async function requestBackgroundChatReply(sessionId: string): Promise<{ o
         const rounds = await generateBackgroundCompletionRounds(
             session,
             latestMessages,
-            { appTags: session.isGroup ? undefined : ["chat", "text"], signal: backgroundController.signal },
+            {
+                appTags: session.isGroup ? undefined : ["chat", "text"],
+                // 定时查岗等事件可带一句「该怎么回应」，只作用于这一轮
+                ephemeralSystemNote: options?.ephemeralSystemNote,
+            },
         );
         if (isBackgroundGenerationCancelled(session.id)) return { ok: false, skipped: "cancelled" };
         const { hasVisible, stateValues } = await saveBackgroundCompletionRounds(
@@ -385,6 +392,40 @@ async function saveBackgroundCompletionRounds(
     return { hasVisible, newCount, stateValues };
 }
 
+// ── 查岗轮询 ──────────────────────────────────────────────
+//
+// 挂在这里而不是另起一套定时器：本服务的 pollSchedules 每 3 秒跑一次，
+// 桌面壳已经把它启动了，查岗只是搭个便车。
+//
+// 两个节流：
+//  · 60 秒才检查一次（查岗间隔是分钟级，3 秒一次纯属浪费）；
+//  · 「上一轮还没跑完」时直接跳过——runCheckIn 会一直等用户在浮层上做决定
+//    （最长 90 秒），不锁的话下一轮又弹一个浮层，两个叠一起根本没法处理。
+const CHECK_IN_POLL_INTERVAL_MS = 60_000;
+let lastCheckInPollAt = 0;
+let checkInPolling = false;
+
+function pollCheckIn(now: number) {
+    if (now - lastCheckInPollAt < CHECK_IN_POLL_INTERVAL_MS) return;
+    lastCheckInPollAt = now;
+    if (checkInPolling) return;
+    checkInPolling = true;
+    // 动态 import：查岗引擎反过来要用本模块的 requestBackgroundChatReply，
+    // 静态 import 会形成循环依赖，运行时解析才是安全的。
+    void import("./screenshot/checkin-engine")
+        .then(async module => {
+            const { hasAnyCheckInEnabled, prepareCheckInService } = await import("./screenshot");
+            if (!hasAnyCheckInEnabled()) return;
+            // App 重启后常驻服务会没掉，而配置里还开着——这时补一次预热。
+            // 只有 App 在前台时才能合法启动前台服务，后台时会失败并等下一轮，
+            // 这是系统限制，不是可以绕过的 bug。
+            prepareCheckInService();
+            await module.pollDueCheckIns();
+        })
+        .catch(() => undefined)
+        .finally(() => { checkInPolling = false; });
+}
+
 function pollSchedules() {
     try {
         const schedules = loadAllFollowUpSchedules();
@@ -402,6 +443,7 @@ function pollSchedules() {
         pollTimedWakeSchedules(now);
         pollMenstrualPeriodCare(now);
         pollIdleReconnect(now);
+        pollCheckIn(now);
     } catch (e) {
         console.error("[FollowUp] pollSchedules error:", e);
     }
@@ -582,6 +624,16 @@ const idleReconnectFiringSet = new Set<string>();
 let lastIdleReconnectPollAt = 0;
 const IDLE_RECONNECT_POLL_INTERVAL_MS = 60_000;
 
+/**
+ * 本地接手冷场重连前，等服务端结果的最长时间。
+ *
+ * 服务端在 fireAt+15s 开始，之后是一次完整的 LLM 调用（实测几十秒）。
+ * 本地若在它跑到一半时查回传箱，只会查到「空」，然后自己再生成一份——
+ * 于是通知栏和聊天里变成两套内容。给足这段时间，让一条主动消息
+ * 只产生一次生成。没有服务端订阅时不会等（见调用处）。
+ */
+const ACTIVE_MESSAGE_SERVER_GRACE_MS = 100_000;
+
 function pollIdleReconnect(now: number) {
     if (now - lastIdleReconnectPollAt < IDLE_RECONNECT_POLL_INTERVAL_MS) return;
     lastIdleReconnectPollAt = now;
@@ -615,6 +667,46 @@ function pollIdleReconnect(now: number) {
     }
 }
 
+/**
+ * 本地接手一次主动生成之前，先给服务端一个机会。
+ *
+ * 服务端在 fireAt+15s 执行（push-generate），本地轮询间隔 60s，谁先跑并不确定：
+ *   · 本地先跑 → 本地生成一份写进聊天；十几秒后服务端又生成一份推通知 → 两套内容；
+ *   · 服务端正在跑（一次完整 LLM 调用，实测几十秒）→ 此刻回传箱仍是空的，
+ *     本地一查「没东西」就自己又跑一遍 → 同样两套内容。
+ * 于是在宽限期内反复查回传箱（force=true 绕过 5 分钟节流），服务端一旦交付就把结果
+ * 并进聊天并返回 true，调用方直接收工，本轮只产生一次生成。
+ *
+ * 只在账号确实有服务端订阅时等待——没有订阅则服务端根本不会跑，白等 100 秒。
+ * 等待期间用户回来发了消息、或这轮被取消，立即放弃（别和服务端抢）。
+ */
+async function awaitServerGenerated(
+    sessionId: string,
+    assistantBefore: number,
+    graceMs: number,
+): Promise<boolean> {
+    const countAssistant = () => loadChatMessages(sessionId).filter(m => m.role === "assistant").length;
+    const newestUserAt = () => {
+        const newest = [...loadChatMessages(sessionId)].reverse().find(m => m.role === "user");
+        return newest ? Date.parse(newest.createdAt) : 0;
+    };
+    if (countAssistant() > assistantBefore) return true;
+    const serverWillRun = await hasAccountPushSubscription().catch(() => false);
+    if (!serverWillRun) return false;
+    const userAtStart = newestUserAt();
+    const deadline = Date.now() + graceMs;
+    while (Date.now() < deadline) {
+        await bgDelay(5_000);
+        if (isBackgroundGenerationCancelled(sessionId)) return false;
+        if (newestUserAt() > userAtStart) return false;
+        await import("./push-outbox-client")
+            .then(m => m.consumeServerOutbox({ force: true }))
+            .catch(() => undefined);
+        if (countAssistant() > assistantBefore) return true;
+    }
+    return false;
+}
+
 async function fireIdleReconnect(rule: IdleReconnectRule, lastUserAt: number) {
     idleReconnectFiringSet.add(rule.id);
     let backgroundController: AbortController | null = null;
@@ -622,7 +714,17 @@ async function fireIdleReconnect(rule: IdleReconnectRule, lastUserAt: number) {
         const session = loadChatSessions().find(s => s.id === rule.sessionId);
         if (!session || session.isGroup || session.contactId !== rule.characterId) return;
 
-        // 本地接手当前这次生成，先撤销服务端同规则排队任务；生成成功后才记连发次数。
+        // 先让服务端跑，别和它抢：它已经生成并推送过这一轮就不必再本地跑第二遍，
+        // 否则通知栏（服务端那次输出）和聊天里（本地这次输出）会是两套不同的内容。
+        // 连发次数与重挂都已由 consumeServerOutbox 处理，这里不必再动。
+        const assistantBefore = loadChatMessages(session.id).filter(m => m.role === "assistant").length;
+        if (await awaitServerGenerated(session.id, assistantBefore, ACTIVE_MESSAGE_SERVER_GRACE_MS)) {
+            window.dispatchEvent(new CustomEvent("followup-fired", { detail: { sessionId: session.id } }));
+            return;
+        }
+
+        // 服务端没交付（无订阅 / 没跑成 / 宽限期到了），本地接手这次生成。
+        // 先撤销服务端同规则排队任务；生成成功后才记连发次数。
         void cancelBailoutPrefix(`idle:${rule.id}:`);
 
         const latestMessages = loadChatMessages(session.id);
@@ -693,6 +795,17 @@ async function fireTimedWake(sched: TimedWakeSchedule) {
 
         const latestMessages = loadChatMessages(session.id);
         const elapsedMinutes = resolveTimedWakeElapsedMinutes(sched, latestMessages, Date.now());
+
+        // 同冷场重连：服务端常常先于本地生成，先把它那轮并进来，避免通知与聊天
+        // 各是两次不同的模型输出。
+        const assistantBeforeWake = loadChatMessages(session.id).filter(m => m.role === "assistant").length;
+        await import("./push-outbox-client")
+            .then(m => m.consumeServerOutbox({ force: true }))
+            .catch(() => undefined);
+        if (loadChatMessages(session.id).filter(m => m.role === "assistant").length > assistantBeforeWake) {
+            window.dispatchEvent(new CustomEvent("followup-fired", { detail: { sessionId: session.id } }));
+            return;
+        }
 
         console.log("[TimedWake] Dispatching followup-started for session:", session.id);
         backgroundController = beginBackgroundApiRun(session.id);
@@ -1182,7 +1295,9 @@ export async function parseAndSaveResponse(
                 dispatchChatMessageNotice({
                     sessionId,
                     senderName: charName,
-                    body: partBody(part).slice(0, 80),
+                    // 截断放宽到 200，与离线推送同口径：壳里这条正文会直接变成
+                    // 系统通知内容，过去 80 字会把稍长的消息截掉半句。
+                    body: partBody(part).slice(0, 200),
                     avatar,
                     ...(isGroup ? { isGroup: true } : {}),
                 });

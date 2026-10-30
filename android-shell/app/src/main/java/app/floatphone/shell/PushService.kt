@@ -7,10 +7,17 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.IBinder
+import android.util.Base64
 import android.webkit.CookieManager
 import androidx.core.app.NotificationCompat
+// RemoteInput 必须用 androidx 版：NotificationCompat.Action.addRemoteInput()
+// 收的是 androidx.core.app.RemoteInput，与框架的 android.app.RemoteInput
+// 是两个类型（同名不同源），混用会直接编译失败。
+import androidx.core.app.RemoteInput
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -51,6 +58,12 @@ class PushService : Service() {
     private val client = OkHttpClient.Builder()
         .pingInterval(25, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .build()
+
+    /** 拉取远程头像用；超时压短，拿不到就退回默认图标，绝不能拖住通知。 */
+    private val avatarClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
         .build()
 
     private var socket: WebSocket? = null
@@ -101,14 +114,19 @@ class PushService : Service() {
 
     /** 借 WebView 的登录 Cookie 调站点接口获取连接参数。 */
     private fun fetchConfig(): PushConfig? = runCatching {
-        val cookie = CookieManager.getInstance().getCookie(MainActivity.SITE_URL) ?: return null
+        // 单机模式（NEXT_PUBLIC_SELF_HOSTED_MODE=true）不走登录流程，WebView 里
+        // 可能完全没有 Cookie。此前这里 `?: return null` 把这种正常情况直接判成
+        // 「未登录」，壳于是永远拿不到配置、常驻通知停在「未登录或站点不可达」。
+        // 改为：Cookie 缺失也照常请求，放不放行交给服务端裁决。
+        val cookie = CookieManager.getInstance().getCookie(MainActivity.SITE_URL).orEmpty()
 
         fun getJson(path: String): JSONObject? {
-            val request = Request.Builder()
+            val builder = Request.Builder()
                 .url("${MainActivity.SITE_URL}$path")
-                .header("Cookie", cookie)
                 .header("Accept", "application/json")
-                .build()
+            // 空 Cookie 头可能被服务端/WAF 拒绝，为空时干脆不带这个头。
+            if (cookie.isNotEmpty()) builder.header("Cookie", cookie)
+            val request = builder.build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return null
                 return JSONObject(response.body?.string() ?: return null)
@@ -143,11 +161,11 @@ class PushService : Service() {
                 )
                 .toString()
                 .toRequestBody("application/json".toMediaType())
-            val request = Request.Builder()
+            val builder = Request.Builder()
                 .url("${MainActivity.SITE_URL}/api/push/subscribe")
-                .header("Cookie", cookie)
                 .post(body)
-                .build()
+            if (cookie.isNotEmpty()) builder.header("Cookie", cookie)
+            val request = builder.build()
             client.newCall(request).execute().use { response ->
                 if (response.isSuccessful) shellSubRegistered = true
             }
@@ -218,7 +236,7 @@ class PushService : Service() {
                         }.isSuccess
                         if (shown) return
                     }
-                    showMessageNotification(title, text2)
+                    showMessageNotification(title, text2, body.optString("sessionId"), body.optString("avatar"))
                 }
             }
 
@@ -267,11 +285,25 @@ class PushService : Service() {
         )
     }
 
-    private fun contentIntent(): PendingIntent = PendingIntent.getActivity(
-        this, 0,
-        Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-        PendingIntent.FLAG_IMMUTABLE,
-    )
+    /**
+     * 点通知的落点：带 sessionId 时经深链直达对应会话，否则回首页。
+     * 深链与 MainActivity 共用 EXTRA_OPEN_URL 通道。
+     */
+    private fun contentIntent(sessionId: String? = null): PendingIntent {
+        val intent = Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val id = sessionId?.trim().orEmpty()
+        if (id.isNotEmpty()) {
+            intent.putExtra(
+                MainActivity.EXTRA_OPEN_URL,
+                "${MainActivity.SITE_URL.trimEnd('/')}/#open-chat=${android.net.Uri.encode(id)}",
+            )
+        }
+        return PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+    }
 
     private fun buildKeepAliveNotification(text: String): Notification =
         NotificationCompat.Builder(this, CH_KEEPALIVE)
@@ -346,19 +378,89 @@ class PushService : Service() {
         getSystemService(NotificationManager::class.java).notify(CallAlert.NOTIF_MISSED_ID, notification)
     }
 
-    private fun showMessageNotification(title: String, body: String) {
-        val notification = NotificationCompat.Builder(this, CH_MESSAGES)
+    private fun showMessageNotification(title: String, body: String, sessionId: String? = null, avatarUrl: String? = null) {
+        val builder = NotificationCompat.Builder(this, CH_MESSAGES)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setAutoCancel(true)
-            .setContentIntent(contentIntent())
+            .setContentIntent(contentIntent(sessionId))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(notifId++, notification)
+        // 角色头像当通知大图标（服务端随广播带的 avatar：data URL 或直链）。
+        // 取不到就退回默认图标——头像只是锦上添花，绝不能拖住或搞丢通知。
+        loadAvatarBitmap(avatarUrl)?.let { builder.setLargeIcon(it) }
+        // 带「回复」按钮：用户可以直接在通知横幅上回一句，不用点开 App。
+        // 没有 sessionId 的通知（系统提醒类）挂了也没处送，所以只在有时才加。
+        val sid = sessionId?.trim().orEmpty()
+        if (sid.isNotEmpty()) builder.addAction(buildReplyAction(sid))
+        getSystemService(NotificationManager::class.java).notify(notifId++, builder.build())
         if (notifId > 400) notifId = 100
     }
+
+    /**
+     * 构造通知上的「回复」动作（系统级快捷回复）。
+     *
+     * PendingIntent 必须是 MUTABLE：用户输入要先被系统填进 RemoteInput，
+     * 不可变的 PendingIntent 装不下这个结果，回复框会打不开。
+     */
+    private fun buildReplyAction(sessionId: String): NotificationCompat.Action {
+        val remoteInput = RemoteInput.Builder(NotificationReplyReceiver.KEY_REPLY_TEXT)
+            .setLabel("回复")
+            .build()
+        val intent = Intent(this, NotificationReplyReceiver::class.java).apply {
+            action = NotificationReplyReceiver.ACTION_REPLY
+            putExtra(NotificationReplyReceiver.EXTRA_SESSION_ID, sessionId)
+        }
+        // requestCode 用 sessionId 的哈希：不同会话各自一个 PendingIntent，
+        // 否则 FLAG_UPDATE_CURRENT 会让后一条通知顶掉前一条的回复目标。
+        val pending = PendingIntent.getBroadcast(
+            this,
+            sessionId.hashCode(),
+            intent,
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return NotificationCompat.Action.Builder(R.drawable.ic_stat, "回复", pending)
+            .addRemoteInput(remoteInput)
+            .setAllowGeneratedReplies(true)
+            .build()
+    }
+
+    /**
+     * 把广播里的头像串变成通知大图标。支持 data:image/... 内联与 http(s) 直链；
+     * 解析失败或超时一律返回 null，调用方退回应用图标。
+     */
+    private fun loadAvatarBitmap(avatarUrl: String?): Bitmap? {
+        val value = avatarUrl?.trim().orEmpty()
+        if (value.isEmpty()) return null
+        // 老壳不认识 avatar 字段时这里是空串，自然跳过；异常也绝不能影响通知。
+        return runCatching {
+            if (value.startsWith("data:image/")) decodeDataUrlBitmap(value) else fetchRemoteAvatar(value)
+        }.getOrNull()
+    }
+
+    /** 解 data:image/png;base64,xxxx 形式的内联头像。 */
+    private fun decodeDataUrlBitmap(dataUrl: String): Bitmap? = runCatching {
+        val comma = dataUrl.indexOf(',')
+        if (comma < 0) return@runCatching null
+        val header = dataUrl.substring(0, comma)
+        if (!header.contains("base64", ignoreCase = true)) return@runCatching null
+        val bytes = Base64.decode(dataUrl.substring(comma + 1), Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }.getOrNull()
+
+    /** 拉取远程头像。可能是站点上的受保护资源，这里带上 WebView 的登录 Cookie；失败返回 null。 */
+    private fun fetchRemoteAvatar(url: String): Bitmap? = runCatching {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return@runCatching null
+        val builder = Request.Builder().url(url)
+        val cookie = CookieManager.getInstance().getCookie(url)
+        if (!cookie.isNullOrEmpty()) builder.header("Cookie", cookie)
+        avatarClient.newCall(builder.build()).execute().use { response ->
+            if (!response.isSuccessful) return@runCatching null
+            val bytes = response.body?.bytes() ?: return@runCatching null
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }
+    }.getOrNull()
 
     private fun sleepSec(sec: Long) {
         runCatching { Thread.sleep(sec * 1000) }

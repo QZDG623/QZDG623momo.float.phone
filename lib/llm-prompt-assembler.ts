@@ -1084,11 +1084,21 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
                !finalPayload[finalPayload.length - 1].toolCalls?.length &&
                finalPayload[finalPayload.length - 1].role !== "tool");
 
-        if (b.imageUrl) {
+        // 防御性校验：只放行真正合法的图片地址。
+        //
+        // 为什么必须有它：用户清理媒体库（或换设备导档）之后，历史里的图片消息会留下
+        // 一个读不出来的引用——media-store://… 指向的 blob 已经不在了。把它原样塞进请求，
+        // 会让**整个请求**被 API 拒绝：
+        //   API Error 400: Unsupported image_url format
+        // 表现是「整个会话突然发不出消息」，而用户完全想不到跟自己删图有关（实测反馈）。
+        // 宁可这一轮少送一张图，也不能让会话哑火。
+        const imageUrlForApi = typeof b.imageUrl === "string" ? b.imageUrl.trim() : "";
+        const usableImageUrl = /^data:image\//i.test(imageUrlForApi) || /^https?:\/\//i.test(imageUrlForApi);
+        if (usableImageUrl) {
             // Vision message: build multi-part content with image (never merged)
             const parts: LLMContentPart[] = [];
             if (processedText) parts.push({ type: "text", text: processedText });
-            parts.push({ type: "image_url", image_url: { url: b.imageUrl, detail: "low" } });
+            parts.push({ type: "image_url", image_url: { url: imageUrlForApi, detail: "low" } });
             finalPayload.push({
                 role: b.role,
                 content: parts,
@@ -2246,11 +2256,21 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
             !finalPayload[finalPayload.length - 1].toolCalls?.length &&
             finalPayload[finalPayload.length - 1].role !== "tool";
 
-        if (b.imageUrl) {
+        // 防御性校验：只放行真正合法的图片地址。
+        //
+        // 为什么必须有它：用户清理媒体库（或换设备导档）之后，历史里的图片消息会留下
+        // 一个读不出来的引用——media-store://… 指向的 blob 已经不在了。把它原样塞进请求，
+        // 会让**整个请求**被 API 拒绝：
+        //   API Error 400: Unsupported image_url format
+        // 表现是「整个会话突然发不出消息」，而用户完全想不到跟自己删图有关（实测反馈）。
+        // 宁可这一轮少送一张图，也不能让会话哑火。
+        const imageUrlForApi = typeof b.imageUrl === "string" ? b.imageUrl.trim() : "";
+        const usableImageUrl = /^data:image\//i.test(imageUrlForApi) || /^https?:\/\//i.test(imageUrlForApi);
+        if (usableImageUrl) {
             // Vision message: build multi-part content with image (never merged)
             const parts: LLMContentPart[] = [];
             if (processedText) parts.push({ type: "text", text: processedText });
-            parts.push({ type: "image_url", image_url: { url: b.imageUrl, detail: "low" } });
+            parts.push({ type: "image_url", image_url: { url: imageUrlForApi, detail: "low" } });
             finalPayload.push({
                 role: b.role,
                 content: parts,

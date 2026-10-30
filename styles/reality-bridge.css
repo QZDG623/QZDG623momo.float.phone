@@ -1,4 +1,73 @@
 /* ═══ 现实桥 · 极简黑白灰 + 紫（参考图定稿：平面/细线图标/黑主钮/紫点缀） ═══ */
+
+/* ── 平台分组导航 ── */
+.rb-platform-switch {
+  display: inline-flex;
+  align-items: center;
+  margin: 6px 0 0;
+  padding: 5px 11px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--rb-sub);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--rb-sub) 40%, transparent);
+  text-underline-offset: 3px;
+}
+.rb-platform-switch:active { opacity: 0.6; }
+
+/* 平台不匹配提示：只在看着「不属于自己设备」的那套时出现。
+   必须给出下一步该做什么，光说「不适用于你」等于把用户丢在原地。 */
+.rb-platform-note {
+  margin: 10px 0 2px;
+  padding: 13px 15px;
+  border-radius: 16px;
+  background: var(--rb-acc-soft);
+  color: var(--rb-acc-text);
+}
+.rb-platform-note b { display: block; font-size: 13px; margin-bottom: 5px; }
+.rb-platform-note p { margin: 0 0 4px; font-size: 12px; line-height: 1.65; color: var(--rb-acc-text); }
+.rb-platform-note-hint { opacity: 0.82; }
+.rb-platform-note-jump {
+  margin-top: 6px;
+  padding: 6px 13px;
+  border: none;
+  border-radius: 999px;
+  background: var(--rb-acc);
+  color: var(--rb-acc-ink);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.rb-platform-note-jump:active { transform: scale(0.95); opacity: 0.85; }
+
+/* 「去设置 →」跳板：凡是需要用户去设置里改开关的地方，都给一个能点的按钮，
+   而不是在文案里写一句路径让他自己翻。文案里的路径念一遍就忘了，
+   能点的按钮省掉他找路的全部成本。 */
+.rb-jump-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 6px 0 2px;
+}
+.rb-link.rb-jump {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: none;
+  background: var(--rb-acc-soft);
+  color: var(--rb-acc-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: transform 0.16s ease, opacity 0.2s ease;
+}
+.rb-link.rb-jump:active { transform: scale(0.94); opacity: 0.8; }
 .reality-bridge-app-shell {
   --rb-bg: #f9f9fb;
   --rb-card: #ffffff;
@@ -279,7 +348,8 @@
   gap: 8px;
   padding: 10px 0 12px;
 }
-/* 分段控件：浅灰轨道 + 白色滑块 */
+/* 分段控件：浅灰轨道 + 白色滑块。
+   首页分区有 6 个 chip，窄屏放不下——窄屏改为横向滚动，不压缩字号。 */
 .rb-chips {
   display: flex;
   gap: 2px;
@@ -288,7 +358,30 @@
   padding: 4px;
   border-radius: 999px;
   background: var(--rb-inset);
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
 }
+.rb-chips::-webkit-scrollbar { display: none; }
+.rb-chips .rb-chip {
+  flex: 0 0 auto;
+  min-width: 62px;
+  padding-left: 10px;
+  padding-right: 10px;
+  gap: 4px;
+}
+/* 平台角标：安卓/iOS 专属分区才带，通用分区不带 */
+.rb-chip em {
+  font-style: normal;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  background: rgba(23, 23, 28, 0.08);
+  color: var(--rb-sub);
+}
+.rb-chip.active em { background: var(--rb-acc-soft); color: var(--rb-acc); }
 .rb-chip {
   display: inline-flex;
   align-items: center;
@@ -435,6 +528,119 @@
   font-variant-numeric: tabular-nums;
 }
 .rb-freq button.sel { background: var(--rb-ink); color: #ffffff; font-weight: 800; }
+
+/* ── 概览 · 统计 ── */
+.rb-stat-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: linear-gradient(135deg, #6d7dff 0%, #8a5cf6 60%, #a24df0 100%);
+  color: #fff;
+  border-radius: 22px;
+  padding: 16px 18px;
+  margin-bottom: 10px;
+  box-shadow: 0 8px 22px rgba(122, 90, 248, 0.3);
+}
+.rb-stat-hero-main b {
+  display: block;
+  font-size: 32px;
+  font-weight: 800;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+.rb-stat-hero-main i { font-style: normal; font-size: 11.5px; opacity: 0.85; }
+.rb-stat-hero-side { display: flex; flex-direction: column; gap: 4px; text-align: right; }
+.rb-stat-hero-side span { font-size: 11.5px; opacity: 0.85; font-variant-numeric: tabular-nums; }
+.rb-stat-hero-side b { font-size: 14px; font-weight: 800; }
+
+.rb-chart-card { padding: 14px 16px 10px; }
+.rb-chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.rb-chart-head b { font-size: 13.5px; font-weight: 800; }
+.rb-chart-head span { font-size: 10.5px; color: var(--rb-sub); font-variant-numeric: tabular-nums; }
+.rb-chart { display: flex; align-items: flex-end; gap: 6px; height: 68px; }
+.rb-chart-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+  gap: 5px;
+}
+.rb-chart-bar {
+  width: 100%;
+  max-width: 26px;
+  border-radius: 5px 5px 3px 3px;
+  background: var(--rb-inset);
+  transition: height 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.rb-chart-bar.has { background: linear-gradient(180deg, #8a5cf6, #6d7dff); }
+.rb-chart-col i {
+  font-style: normal;
+  font-size: 9.5px;
+  color: var(--rb-sub);
+  font-variant-numeric: tabular-nums;
+}
+
+.rb-rank { display: flex; flex-direction: column; gap: 9px; margin-top: 10px; }
+.rb-rank-row { display: flex; align-items: center; gap: 9px; }
+.rb-rank-name {
+  width: 74px;
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rb-rank-track {
+  flex: 1;
+  min-width: 0;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--rb-inset);
+  overflow: hidden;
+}
+.rb-rank-track i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #6d7dff, #a24df0);
+  transition: width 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.rb-rank-num {
+  width: 26px;
+  flex: 0 0 auto;
+  text-align: right;
+  font-size: 11px;
+  color: var(--rb-sub);
+  font-variant-numeric: tabular-nums;
+}
+
+.rb-attention { display: flex; flex-direction: column; gap: 12px; }
+.rb-attn-row { display: flex; align-items: center; gap: 11px; }
+.rb-attn-row + .rb-attn-row { padding-top: 12px; border-top: 1px solid var(--rb-line); }
+
+/* ── 通用状态行（非概览分区顶部） ── */
+.rb-statusline {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 2px 6px 10px;
+  font-size: 11.5px;
+  color: var(--rb-sub);
+  font-variant-numeric: tabular-nums;
+}
+.rb-statusline .ok { color: var(--rb-ok); font-weight: 700; }
+.rb-statusline .warn { color: var(--rb-warn); font-weight: 700; }
+.rb-statusline em { width: 3px; height: 3px; border-radius: 50%; background: var(--rb-line); flex: 0 0 auto; }
 
 /* ── 首页 · 状态磁贴 ── */
 .rb-tiles { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }

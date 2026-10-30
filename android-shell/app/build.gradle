@@ -16,8 +16,8 @@ android {
         applicationId "app.floatphone.shell"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "1.0.0"
+        versionCode 32
+        versionName "1.0.33"
         buildConfigField "String", "SITE_URL", "\"${siteUrl}\""
     }
 

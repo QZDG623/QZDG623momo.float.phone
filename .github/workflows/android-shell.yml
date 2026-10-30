@@ -20,7 +20,7 @@ jobs:
       SHELL_KEYSTORE_PASSWORD: ${{ secrets.SHELL_KEYSTORE_PASSWORD }}
       SHELL_KEY_ALIAS: ${{ secrets.SHELL_KEY_ALIAS }}
       SHELL_KEY_PASSWORD: ${{ secrets.SHELL_KEY_PASSWORD }}
-      SHELL_SITE_URL: ${{ inputs.site_url || vars.SHELL_SITE_URL }}
+      SHELL_SITE_URL: ${{ inputs.site_url || vars.SHELL_SITE_URL || 'https://xzqfloat.netlify.app' }}
     steps:
       - uses: actions/checkout@v4
 
